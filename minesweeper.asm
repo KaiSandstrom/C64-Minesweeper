@@ -14,45 +14,79 @@
 ;*******************************************************************************
 
 
-; c64 graphics addresses and built-in routines. Some are only used during 
+; C64 graphics addresses and built-in routines. Some are only used during 
 ; 	initial startup, but are defined here for the sake of readability.
 
 
-; keyboard I/O
+; Keyboard I/O
 GETCHAR = $FFE4
 PUTCHAR = $FFD2
 
 
 ; SID chip addresses used for pseudorandom number generation
-SID_CTRL_3 = $D412
-SID_FREQ_3_LOW = $D40E
+SID_CTRL_3      = $D412
+SID_FREQ_3_LOW  = $D40E
 SID_FREQ_3_HIGH = $D40F
-RANDOM = $D41B
+RANDOM          = $D41B
 
 
-; video mode and video memory constants
-FRAME_COLOR = $D020
-BACKGROUND_COLOR = $D021
-V_MODE_CTRL = $D011
-VIC_BANK_SELECT = $DD00
-V_MEMORY_LOCATION = $D018
-COLOR = $4000
-BITMAP = $6000
+; Video mode and video memory constants
+FRAME_COLOR         = $D020
+BACKGROUND_COLOR    = $D021
+V_MODE_CTRL         = $D011
+VIC_BANK_SELECT     = $DD00
+V_MEMORY_LOCATION   = $D018
+COLOR               = $4000
+BITMAP              = $6000
+MODE_CLEAR_MASK     = $FC
+MODE_BITMAP_MASK    = $02
+MODE_TEXT_MASK      = $03
+BITMAP_MEM_LOCATION = $08
+TEXT_MEM_LOCATION   = $14
+V_MODE_BITMAP_MASK  = $20
+V_MODE_TEXT_MASK    = $DF
 
 
-; sprite position addresses
-INNER_SPRITE_X = $D000
-INNER_SPRITE_Y = $D001
-OUTER_SPRITE_X = $D002
-OUTER_SPRITE_Y = $D003
-SPRITES_X_MSB = $D010
+; Color value constants
+; For bitmap graphics, these values will be ANDed with $0F to set the color of
+;	graphics cells' 1 bits to black, and the 0 bits to the relevant color.
+BLACK      = $00
+WHITE      = $11
+LIGHT_GRAY = $FF
+MID_GRAY   = $CC
+DARK_GRAY  = $BB
+LIGHT_RED  = $AA
+DARK_RED   = $22
+LIGHT_BLUE = $EE
+DARK_BLUE  = $66
+CYAN       = $33
+GREEN      = $55
+BROWN      = $99
+ORANGE     = $88
 
+; Sprite addresses and constants
+INNER_SPRITE_X        = $D000
+INNER_SPRITE_Y        = $D001
+OUTER_SPRITE_X        = $D002
+OUTER_SPRITE_Y        = $D003
+SPRITES_X_MSB         = $D010
+INNER_SPRITE_LOCATION = $4400
+OUTER_SPRITE_LOCATION = $5000
+INNER_SPRITE_OFFSET   = 16
+OUTER_SPRITE_OFFSET   = 64
+INNER_SPRITE_POINTER  = $43F9
+OUTER_SPRITE_POINTER  = $43F8
+INNER_SPRITE_COLOR    = $D027
+OUTER_SPRITE_COLOR    = $D028
+SHOW_SPRITES_REG      = $D015
+SHOW_SPRITES_MASK     = $03
+HIDE_SPRITES_MASK     = $FC
 
 ; Game constants
-X_RANGE = 20
-Y_RANGE = 12
+X_RANGE     = 20
+Y_RANGE     = 12
 TOTAL_CELLS = (X_RANGE*Y_RANGE)
-MINES = 40
+MINES       = 40
 
 
 ;*******************************************************************************
@@ -60,12 +94,18 @@ MINES = 40
 ;*******************************************************************************
 
 
-; Game Over flag. 0 when game is ongoing, 1 when current game is won or lost.
+; Game Over flag. 0 when game is over, 1 when game is ongoing, 2 when game has
+;	not yet been started (board mines are not yet initialized).
 game_over = $02
 
 
 ; $03 and $04 are scratch variables, used for several purposes.
-scratch = $03
+scratch            = $03
+mines_placed       = scratch
+line_of_three      = scratch+1
+current_color      = scratch
+num_flags_adjacent = scratch
+num_unrevealed     = scratch+1
 
 
 ; Stores the position of the cursor. These values are sometimes manipulated to 
@@ -81,28 +121,74 @@ cursor_y = $06
 ;	relevant array is insufficient. These provide an easy way to tell when 
 ;	the end of the array is reached.
 current_line = $9B
-current_col = $9C
-
-
-; These variables conflict with uses of the scratch variables, but not with each
-;	other, so they share a single separate address.
-mines_placed = $2A
-line_of_three = $2A
-current_color = $2A
+current_col  = $9C
 
 
 ; Pointers into various memory locations used in the representation of cells.
-cells_ptr = $FB
-color_ptr = $FD
-bitmap_ptr = $F7
-graphics_ptr = $F9
+cells_ptr       = $FB
+color_ptr       = $FD
+bitmap_ptr      = $F7
+graphics_ptr    = $F9
+stack_queue_ptr = $BB
 
 
 ; Stores an address to be jumped to for a specific operation, used in the
-;	abstract looping routines. Currently unused, will be updated later.
-routine_var = $C1
+;	abstract looping routines.
+subroutine_ptr = $C1
 
 
+; ******************************************************************************
+; * Cells Array                                                                *
+; ******************************************************************************
+
+
+; The cell bytes array is located near the end of program memory, after the
+;	graphics. It is 240 bytes long, the same as the number of cells in the
+;	20x12 board. It is explained here instead of at the end of the file for
+;	the sake of readability.
+
+; The functions of the bits in a state byte are as follows:
+;	Bit 7: Set if the cell is a mine.
+;	Bit 6: Set if the cell is flagged.
+;	Bit 5: Set if the cell is revealed.
+;	Bit 4: Set if the cell has been updated since it was last drawn.
+
+;	If the cell is not a mine (bit 7 is clear):
+;	Bits 3-0: Store the integer number of mines adjacent to this cell (0-8).
+
+;	If the cell is a mine (bit 7 is set):
+;	Bits 3-1: Unused.
+;	Bit 0: Set if this specific cell was the one clicked by the player to
+;		lose the game.
+
+
+cells_array = after_graphics
+	
+	
+; ******************************************************************************
+; * Chain Click Stack-Queue                                                    *
+; ******************************************************************************
+
+
+; This structure is used when chain-clicking cells with zero adjacent mines. As
+;	will be explained with the left-click routine, the original recursive
+;	approach to clicking all adjacent cells had the possibility of
+;	overflowing the 6502 stack under certain circumstances. The stack-queue
+;	is placed in memory after the graphics and cells array, with no other
+;	program code or data following it, allowing it to grow as much as
+;	necessary. The theoretical maximum size in the astronomically unlikely
+;	worst-case scenario is 372 bytes, found through experimentation.
+
+; This structure is implemented as a LIFO stack. It is described as a 
+;	"stack-queue" because its function is to store the address and
+;	coordinates of cells that are waiting to be expanded. The only reason it
+;	was implemented as a stack instead of a queue was convenience -- a stack
+;	implementation only requires one pointer and can grow to whatever
+;	arbitrary size is necessary without creeping through memory.
+
+stack_queue = (after_graphics+TOTAL_CELLS)
+
+	
 ;*******************************************************************************
 ;*  Common Subroutines                                                         *
 ;*******************************************************************************
@@ -317,7 +403,6 @@ graphics_ptr_up:
 	
 cursor_left:
 	lda cursor_x
-	cmp #0
 	bne @move
 	rts
 @move:
@@ -362,7 +447,6 @@ cursor_right:
 	
 cursor_up:
 	lda cursor_y
-	cmp #0
 	bne @move
 	rts
 @move:
@@ -398,29 +482,218 @@ cursor_down:
 ; ------------------------------------------------
 
 
+; Stack-queue routines: Add or fetch the cells pointer, current line, and
+;	current column values from the stack-queue and update the stack-queue
+;	pointer accordingly
+
+stack_queue_put:
+	ldy #0
+	lda cells_ptr
+	sta (stack_queue_ptr), y
+	iny
+	lda cells_ptr+1
+	sta (stack_queue_ptr), y
+	iny
+	lda current_line
+	sta (stack_queue_ptr), y
+	iny
+	lda current_col
+	sta (stack_queue_ptr), y
+	lda stack_queue_ptr
+	clc
+	adc #4
+	sta stack_queue_ptr
+	lda stack_queue_ptr+1
+	adc #0
+	sta stack_queue_ptr+1
+	rts
+	
+stack_queue_get:
+	lda stack_queue_ptr
+	sec
+	sbc #4
+	sta stack_queue_ptr
+	lda stack_queue_ptr+1
+	sbc #0
+	sta stack_queue_ptr+1
+	ldy #0
+	lda (stack_queue_ptr), y
+	sta cells_ptr
+	iny
+	lda (stack_queue_ptr), y
+	sta cells_ptr+1
+	iny
+	lda (stack_queue_ptr), y
+	sta current_line
+	iny
+	lda (stack_queue_ptr), y
+	sta current_col
+	rts
+	
+; ------------------------------------------------
+
+
+; ********** Abstract Looping Routines ***********
+
+
+; With the cells array pointer and x/y position variables set prior to the call,
+;	this subroutine performs an abstract task on each of the cells adjacent
+;	to the original. The address of the abstract task's subroutine is loaded
+;	into the subroutine pointer before this routine is called.
+
+for_all_surrounding:
+	lda #0
+	sta line_of_three
+@check_top_row:
+	lda current_line
+	bne @do_first_row
+	inc line_of_three
+	jmp @process_row
+@do_first_row:
+	jsr cells_ptr_up
+	dec current_line
+@process_row:
+@left_col:
+	lda current_col
+	beq @middle_col
+	jsr cells_ptr_left
+	dec current_col
+	jsr do_task
+	inc current_col
+	jsr cells_ptr_right
+@middle_col:
+	lda line_of_three
+	cmp #1
+	beq @right_col
+	jsr do_task
+@right_col:
+	lda current_col
+	cmp #(X_RANGE-1)
+	beq @next_line
+	jsr cells_ptr_right
+	inc current_col
+	jsr do_task
+	dec current_col
+	jsr cells_ptr_left
+@next_line:
+	lda line_of_three
+	cmp #2
+	bne @not_last_row
+	jsr cells_ptr_up
+	dec current_line
+	rts
+@not_last_row:
+	lda line_of_three
+	cmp #1
+	bne @to_next
+	lda current_line
+	cmp #(Y_RANGE-1)
+	beq @end
+@to_next:
+	inc line_of_three
+	inc current_line
+	jsr cells_ptr_down
+	jmp @process_row
+@end:
+	rts
+	
+	
+; Simply jumps to the subroutine stored in the subroutine pointer. The rts
+;	instruction at the end of the stored subroutine will return execution to
+;	the point in for_all_adjacent from which do_task was called.
+
+do_task:
+	jmp (subroutine_ptr)
+	
+
 ; *********** Other Common Subroutines ***********
 	
+
+; These routines show and hide the two sprites that make up the cursor,
+;	respectively.
+
+show_sprites:
+	lda SHOW_SPRITES_REG
+	ora #SHOW_SPRITES_MASK
+	sta SHOW_SPRITES_REG
+	rts
+
+hide_sprites:
+	lda SHOW_SPRITES_REG
+	and #HIDE_SPRITES_MASK
+	sta SHOW_SPRITES_REG
+	rts
 	
-; This simple routine is used to draw one individual 8x8 pixel graphics cell.
-;	The graphics pointer has previously been set to the correct graphics
-;	cell, defined in the penultimate section of this file just before the
-;	cell byte array, and the color variable in the zero page has been set
-;	to the cell's color. 
 	
-draw_one_cell:
+; Since the game board only uses 24 out of 25 rows, the final row of the screen
+;	must be filled in with the frame color. This routine performs this 
+;	action using the color stored in the current_color variable.
+	
+draw_last_strip:
+	lda #<COLOR
+	clc
+	adc #192
+	sta color_ptr
+	lda #>COLOR
+	adc #3
+	sta color_ptr+1
 	lda current_color
 	ldy #0
-	sta (color_ptr), y
 @loop:
-	cpy #8
+	cpy #(X_RANGE*2)
 	beq @end
-	lda (graphics_ptr), y
-	sta (bitmap_ptr), y
+	sta (color_ptr), y
 	iny
 	jmp @loop
 @end:
 	rts
+
+
+; Sets the VIC to bitmap mode, pointing to the appropriate memory locations to
+;	display the board. Used on initial startup, and when exiting the
+;	instructions screen.
+
+switch_screen_bitmap:	
+	lda VIC_BANK_SELECT
+	and #MODE_CLEAR_MASK
+	ora #MODE_BITMAP_MASK
+	sta VIC_BANK_SELECT
 	
+	lda #BITMAP_MEM_LOCATION
+	sta V_MEMORY_LOCATION
+	
+	lda V_MODE_CTRL
+	ora #V_MODE_BITMAP_MASK
+	sta V_MODE_CTRL
+	
+	lda #DARK_GRAY
+	sta FRAME_COLOR
+	
+	rts
+	
+	
+; Sets the VIC to text mode, pointing to the appropriate memory locations to
+;	display the info screen. Used when displaying the info screen during
+;	a game.
+	
+switch_screen_text:
+	lda VIC_BANK_SELECT
+	and #MODE_CLEAR_MASK
+	ora #MODE_TEXT_MASK
+	sta VIC_BANK_SELECT
+	
+	lda #TEXT_MEM_LOCATION
+	sta V_MEMORY_LOCATION
+	
+	lda V_MODE_CTRL
+	and #V_MODE_TEXT_MASK
+	sta V_MODE_CTRL
+	
+	lda #BLACK
+	sta FRAME_COLOR
+	
+	rts
+
 	
 ;******************************************************************************
 ;*  Game Initial Startup Code                                                 *
@@ -428,10 +701,9 @@ draw_one_cell:
 	
 	
 ; This section of code is run only once, when the game starts for the first
-;	time. The splash/instructions screen is loaded with text, and the
-;	bitmap screen in another bank is loaded with a black screen before
-;	switching to another bank and putting the VIC in bitmap mode. Execution
-;	flows directly from this initialization stage into the main game loop.
+;	time. The splash/instructions screen is loaded with text, the sprites
+;	and SID pseudorandom number generator are initialized, and the screen is
+;	loaded with empty board cells.
 	
 	
 ; Load intro screen text from definition in graphics section near the bottom
@@ -440,7 +712,7 @@ draw_one_cell:
 ;	screen again.
 
 show_intro_screen:
-	ldx #0
+	ldx #BLACK
 	stx BACKGROUND_COLOR
 	stx FRAME_COLOR
 @loop:	
@@ -476,7 +748,6 @@ last_few:
 
 await_input:
 	jsr GETCHAR
-	cmp #0
 	beq await_input
 	
 	
@@ -491,82 +762,6 @@ init_SID_random:
 	sta SID_CTRL_3
 	
 
-; Load the first 24 rows of the screen with black bitmap cells. Since only 24 of
-;	25 rows are used for the board, the last strip will be set to the
-;	background color in another routine.
-	
-clear_screen:
-	lda #<BITMAP
-	sta bitmap_ptr
-	lda #>BITMAP
-	sta bitmap_ptr+1
-	lda #<COLOR
-	sta color_ptr
-	lda #>COLOR
-	sta color_ptr+1
-	lda #0
-	sta scratch
-	ldy #0
-@bitmap_loop:
-	lda #0
-	sta (bitmap_ptr), y
-	iny
-	cpy #0
-	bne @bitmap_loop
-	inc scratch
-	inc bitmap_ptr+1
-	lda scratch
-	cmp #$19
-	beq @last_64
-	jmp @bitmap_loop
-@last_64:
-	lda #0
-	cpy #64
-	beq @clear_color
-	sta (bitmap_ptr), y
-	iny
-	jmp @last_64
-@clear_color:
-	sta scratch
-	ldy #0
-@color_loop:
-	lda #0
-	sta (color_ptr), y
-	iny
-	cpy #0
-	bne @color_loop
-	inc scratch
-	inc color_ptr+1
-	lda scratch
-	cmp #$03
-	beq @last_192_black
-	jmp @color_loop
-@last_192_black:
-	cpy #192
-	beq @end
-	lda #0
-	sta (color_ptr), y
-	iny
-	jmp @last_192_black
-@end:
-
-	lda #$0B
-	sta FRAME_COLOR
-	sta BACKGROUND_COLOR
-	
-	lda V_MODE_CTRL
-	ora #$20
-	sta V_MODE_CTRL
-	
-	lda VIC_BANK_SELECT
-	and #$FC
-	ora #$02
-	sta VIC_BANK_SELECT
-	
-	lda #08
-	sta V_MEMORY_LOCATION
-	
-
 ; Load the two sprites, always displayed together in the same location, from
 ;	their definitions in the graphics section into screen memory, and
 ;	set the relevant registers to display these sprites.
@@ -577,21 +772,39 @@ init_sprites:
 	cpx #63
 	beq @end
 	lda sprite_inner, x
-	sta $4400, x
+	sta INNER_SPRITE_LOCATION, x
 	lda sprite_outer, x
-	sta $5000, x
+	sta OUTER_SPRITE_LOCATION, x
 	inx
 	jmp @loop
 @end:
-	lda #64
-	sta $43F8
-	lda #16
-	sta $43F9
+	lda #INNER_SPRITE_OFFSET
+	sta INNER_SPRITE_POINTER
+	lda #OUTER_SPRITE_OFFSET
+	sta OUTER_SPRITE_POINTER
 	
-	lda #$22
-	sta $D027
-	lda #$11
-	sta $D028
+	lda #DARK_RED
+	sta INNER_SPRITE_COLOR
+	lda #WHITE
+	sta OUTER_SPRITE_COLOR
+	
+	
+; Copy the initial board into screen memory. This will be redundantly executed
+;	below in the outer game loop, but it needs to be done on initial startup
+;	in order to avoid seeing the initial screen garbage get overwritten with
+;	board data.
+	
+	jsr draw_board
+	
+	
+; Draw the last strip in border color. Like the above, this is redundant, but
+;	is important for displaying the screen correctly the instant the text
+;	screen is switched to bitmap.
+	
+	lda #DARK_GRAY
+	sta current_color
+	jsr draw_last_strip	
+
 	
 
 ; ******************************************************************************
@@ -614,37 +827,17 @@ new_game:
 	sta cursor_y
 	lda #9
 	sta cursor_x
-	lda #0
+	lda #2
 	sta game_over
-	lda #$0B
-	sta FRAME_COLOR
-	lda #$FF
+	lda #<stack_queue
+	sta stack_queue_ptr
+	lda #>stack_queue
+	sta stack_queue_ptr+1
 
 
-; Draw 25th row in frame color
-	
-last_strip:
-	lda #<COLOR
-	clc
-	adc #192
-	sta color_ptr
-	lda #>COLOR
-	adc #3
-	sta color_ptr+1
-	lda #$BB
-	ldy #0
-@loop:
-	cpy #(X_RANGE*2)
-	beq @end
-	sta (color_ptr), y
-	iny
-	jmp @loop
-@end:
-
-
-; Initialize the board with blank cells. As is explained with the cell array
-;	definition at the bottom of this file, the byte $10 represents a
-;	non-mine, unflagged, unrevealed, updated cell with no adjacent mines.
+; Initialize the board with blank cells. As is explained in the cell array
+;	definition, the byte $10 represents a non-mine, unflagged, unrevealed,
+;	updated cell with no adjacent mines.
 
 initialize_cells:
 	ldx #0
@@ -659,7 +852,15 @@ initialize_cells:
 	jsr draw_board
 
 
-; Position the sprites according to starting position
+
+; Draw 25th row in frame color
+
+	lda #DARK_GRAY
+	sta current_color
+	jsr draw_last_strip
+
+
+; Position the sprites according to starting position and set them active.
 
 pos_sprites:	
 	lda #23
@@ -672,7 +873,6 @@ pos_sprites:
 	
 	lda #0
 	sta SPRITES_X_MSB
-	
 y_pos_sprites:	
 	ldx #0
 @loop:
@@ -709,18 +909,14 @@ x_pos_sprites:
 	inx
 	jmp @loop
 @end:
-	lda $D015
-	ora #$03
-	sta $D015
+	jsr show_sprites
 
+	
+; Put the VIC chip into bitmap mode, pointing to the appropriate memory banks.
+;	This is redundant all times this code is executed except the first, but
+;	is used to ensure the screen is not shown until it is fully set up.
 
-; A special value in scratch is used to signal that the board has not yet been
-;	initialized. This will change to a special value of game_over in the
-;	future.
-
-set_not_started:
-	lda #$FF
-	sta scratch
+	jsr switch_screen_bitmap
 
 
 ; ******************************************************************************
@@ -736,66 +932,68 @@ set_not_started:
 get_input:
 	jsr GETCHAR
 	tax
+@check_n:
 	cmp #$4E
-	bne @not_n
-	lda scratch
-	cmp #$FF
+	bne @check_i
+	lda game_over
+	cmp #2
 	beq get_input
 	jmp new_game
-@not_n:
+@check_i:
 	tax
 	cmp #$49
-	bne @not_i
+	bne @check_game_over
 	jsr show_intro_again
 	jmp get_input
-@not_i:
+@check_game_over:
 	lda game_over
-	beq @not_game_over
+	bne @check_w
 	jmp get_input
-@not_game_over:
+@check_w:
 	txa
 	cmp #$57
-	bne @not_w
+	bne @check_a
 	jsr cursor_up
 	jmp get_input
-@not_w:
+@check_a:
 	txa
 	cmp #$41
-	bne @not_a
+	bne @check_s
 	jsr cursor_left
 	jmp get_input
-@not_a:
+@check_s:
 	txa
 	cmp #$53
-	bne @not_s
+	bne @check_d
 	jsr cursor_down
 	jmp get_input
-@not_s:
+@check_d:
 	txa
 	cmp #$44
-	bne @not_d
+	bne @check_e
 	jsr cursor_right
 	jmp get_input
-@not_d:
+@check_e:
 	txa
 	cmp #$45
-	bne @not_e
-	lda scratch
-	cmp #$FF
+	bne @check_space
+	lda game_over
+	cmp #2
 	beq get_input
 	jsr right_click_cell
 	jsr draw_board
 	jsr check_state
 	jmp get_input
-@not_e:
+@check_space:
 	txa
 	cmp #$20
 	bne get_input
-	lda scratch
-	cmp #$FF
+	lda game_over
+	cmp #2
 	bne @after_first_click
-	jsr randomize_board
-	jsr count_adjacent
+	lda #1
+	sta game_over
+	jsr initialize_mines
 @after_first_click:
 	jsr left_click_cell
 	jsr draw_board
@@ -815,77 +1013,42 @@ get_input:
 
 
 ; Switches the VIC back to the default bank and default text mode to display the
-;	screen data loaded at the beginning of the program, waits for user input,
-;	then switches back to the main board view.
+;	screen data loaded at the beginning of the program, waits for user 
+;	input, then switches back to the main board view.
 	
 show_intro_again:
-	lda $D015
-	and #$FC
-	sta $D015
-	lda FRAME_COLOR
-	pha
-	lda #0
-	sta BACKGROUND_COLOR
-	sta FRAME_COLOR
-	lda #$14
-	sta V_MEMORY_LOCATION
-	lda V_MODE_CTRL
-	and #$DF
-	sta V_MODE_CTRL
-	lda VIC_BANK_SELECT
-	and #$FC
-	ora #$03
-	sta VIC_BANK_SELECT
+	jsr hide_sprites
+	jsr switch_screen_text
 @await_input:
 	jsr GETCHAR
-	cmp #0
 	beq @await_input
-	pla
-	sta FRAME_COLOR
-	lda #$08
-	sta V_MEMORY_LOCATION
-	lda V_MODE_CTRL
-	ora #$20
-	sta V_MODE_CTRL
-	lda VIC_BANK_SELECT
-	and #$FC
-	ora #$02
-	sta VIC_BANK_SELECT
-	lda $D015
-	ora #$03
-	sta $D015
+	jsr switch_screen_bitmap
+	lda game_over
+	beq @return
+	jsr show_sprites
+@return:
 	rts
 
 
-; Check for a win or loss, and update the frame color (and 25th bitmap row)
+; Checks for a win or loss, and updates the frame color (and 25th bitmap row)
 ;	accordingly: red for loss, green for win.
+; When checking for a win, one of the zeropage scratch variables is used to
+;	count flagged cells, and the other is used to count unrevealed cells. If
+;	the number of flags equals the MINES constant and the number of
+;	unrevealed cells is zero, the game is won.
 
 check_state:
 	lda game_over
-	beq not_loss
-	lda #$22
+	bne not_loss
+	lda #DARK_RED
 	sta FRAME_COLOR
-	lda #<COLOR
-	clc
-	adc #192
-	sta color_ptr
-	lda #>COLOR
-	adc #3
-	sta color_ptr+1
-	lda #$22
-	ldy #0
-@loop:
-	cpy #(X_RANGE*2)
-	beq @end
-	sta (color_ptr), y
-	iny
-	jmp @loop
-@end:
+	sta current_color
+	jsr draw_last_strip
 	rts
 not_loss:
 	lda #0
-	sta scratch
-	sta scratch+1
+	sta num_flags_adjacent
+	sta num_unrevealed
 	lda #<cells_array
 	sta cells_ptr
 	lda #>cells_array
@@ -903,42 +1066,26 @@ not_loss:
 	iny
 	jmp @loop
 @flagged:
-	inc scratch
+	inc num_flags_adjacent
 	iny
 	jmp @loop
 @unrevealed:
-	inc scratch+1
+	inc num_unrevealed
 	iny
 	jmp @loop
 @end:
-	lda scratch+1
-	cmp #0
+	lda num_unrevealed
 	bne @return
-	lda scratch
+	lda num_flags_adjacent
 	cmp #MINES
 	bne @return
-	lda #1
+	lda #0
 	sta game_over
-	lda $D015
-	and #$FC
-	sta $D015
-	lda #$55
+	jsr hide_sprites
+	lda #GREEN
 	sta FRAME_COLOR
-	lda #<COLOR
-	clc
-	adc #192
-	sta color_ptr
-	lda #>COLOR
-	adc #3
-	sta color_ptr+1
-	lda #$55
-	ldy #0
-@loop2:
-	cpy #(X_RANGE*2)
-	beq @return
-	sta (color_ptr), y
-	iny
-	jmp @loop2
+	sta current_color
+	jsr draw_last_strip
 @return:
 	rts
 
@@ -961,6 +1108,7 @@ set_cells_ptr_to_cursor:
 	lda #>cells_array
 	sta cells_ptr+1
 	ldx cursor_y
+	stx current_line
 @y_loop:
 	cpx #0
 	beq @end
@@ -969,6 +1117,7 @@ set_cells_ptr_to_cursor:
 	jmp @y_loop
 @end:
 	ldx cursor_x
+	stx current_col
 @x_loop:
 	cpx #0
 	beq @done
@@ -995,6 +1144,7 @@ right_click_cell:
 	sta (cells_ptr), y
 	and #$20
 	beq @not_flagged
+@flagged:
 	lda (cells_ptr), y
 	and #$DF
 	sta (cells_ptr), y
@@ -1006,319 +1156,231 @@ right_click_cell:
 	rts
 	
 
-; This next routine is really a few smaller routines, and depending on what
-;	specific operation is invoking it, a few of these sub-steps can be
-;	jumped to. When a left-click is invoked from the keyboard, there are two
-;	valid cases: An unrevealed cell was clicked, or a revealed cell with the
-;	appropriate number of adjacent flags was clicked. When an unrevealed
-;	cell with zero adjacent mines is clicked, all adjacent cells must be
-;	recursively revealed to reveal the largest possible contiguous area with
-;	no adjacent mines. 
+; The left-click routine is complicated by the fact that when an unflagged,
+;	unrevealed cell with no adjacent mines is clicked, all surrounding
+;	unflagged cells must be programmatically clicked, which can in turn
+;	trigger additional chain clicks on their adjacent cells. The original
+;	implementation of the chain-click algorithm used recursive subroutine
+;	calls, and required pushing an index variable on to the stack as well,
+;	using three bytes of stack memory for each recursive call. In the
+;	unlikely event that any given click revealed about one third of the
+;	board, this would result in a stack overflow. No stack overflows
+;	occurred when testing this approach, but the issue was made clear after
+;	abstracting the task of looping through all adjacent cells to a
+;	subroutine with indirect jumps to the relevant task -- the additional
+;	subroutine call made stack overflows occur with significant frequency.
 
-; The first label, left_click_cell, is jumped to when the player invokes a 
-;	"left click" from the keyboard. It checks whether or not the cell is
-;	revealed, and if it is, jumps to a later routine to check how many flags
-;	are adjacent to it. This operation will be explained later with the
-;	relevant routine. If the cell is not revealed, the following label,
-;	click_cells_recursive, with its redundant revealed check, is bypassed.
+; The solution is to use a separate structure from the 6502 stack with enough
+;	memory to store all necessary information in the (astronomically 
+;	unlikely) worst-case scenario. In this code, the structure is called a
+;	"stack-queue," as information is fetched LIFO, but the structure is
+;	used much like a typical queue -- eligible cell's eligible neighbors
+;	are all added before the next cell's information is fetched. For
+;	example, the first cell's top-left neighbor will be the first cell
+;	added to the stack-queue, but of the first cell's neighbors, it will be
+;	the last to be processed.
 
-; click_cells_recursive is only called from inside this routine, when an
-;	unrevealed cell with no adjacent mines is found. Like left_click_cell,
-;	this section checks if a cell is revealed, but since it's only called
-;	recursively and clicks on appropriately-flagged revealed cells can only
-;	come from the user, it simply returns when a revealed cell is found.
-
-; click_cell_no_revealed_check is jumped to from the click_surrounding routine,
-;	which will be explained later. A jump to this label bypasses the 
-;	revealed check, as it will be called on a revealed cell that has been
-;	confirmed to have the correct number of adjacent flags. If it has zero
-;	adjacent mines, its surrounding cells will be clicked recursively 
-;	according to the normal rules.
+; Due to this complication, the entire left-click routine revolves around the
+;	use of this stack-queue. First, the routine checks if a cell is already
+;	revealed or is a mine, which are handled by separate code incompatible
+;	with the stack-queue loop. Otherwise, reveal_put_valid_cell is called,
+;	which performs additional checks, and depending on the results, may
+;	set the cell to revealed and/or add it to the stack-queue. Next, the
+;	routine checks if the stack-queue is empty. Following the call to
+;	the previous subroutine, this will be the case if any cell that is not
+;	unflagged and unrevealed with no adjacent mines was clicked by the
+;	user. If the stack-queue is empty, the routine simply returns, as the
+;	call to reveal_put_valid_cell already cet the cell to revealed if
+;	applicable. If the stack-queue is not empty, a chain-click must occur.
+;	The most-recently-added element in the stack-queue is fetched, and 
+;	the abstract for_all_adjacent subroutine is called with 
+;	reveal_put_valid_cell loaded into the subroutine pointer. After this is
+;	complete, execution jumps back to the start of the chain-click loop, and
+;	this loop continues executing until the stack-queue is empty.
 
 left_click_cell:
 	jsr set_cells_ptr_to_cursor
 	ldy #0
 	lda (cells_ptr), y
 	and #$40
-	beq click_cell_no_revealed_check
-	jsr click_surrounding
-click_cells_recursive:
-	jsr set_cells_ptr_to_cursor
+	bne click_surrounding
+@chain_click_init:
+	lda #<reveal_put_valid_cell
+	sta subroutine_ptr
+	lda #>reveal_put_valid_cell
+	sta subroutine_ptr+1
+	jsr reveal_put_valid_cell
+chain_click_loop:
+	lda stack_queue_ptr
+	cmp #<stack_queue
+	bne @get_next_cell
+	lda stack_queue_ptr+1
+	cmp #>stack_queue
+	bne @get_next_cell
+	rts
+@get_next_cell:
+click_adjacent_cells:
+	jsr stack_queue_get
+	jsr for_all_surrounding
+	jmp chain_click_loop
+reset_stack_queue_ptr:
+	rts
+
+
+; As was explained earlier, this subroutine is called when left-clicking a
+;	cell. If the cell is already revealed or is flagged, it simply returns.
+;	Next the routine checks if the cell is a mine -- this only occurs when
+;	a click has been made on a revealed cell with the correct number of
+;	adjacent flags. If it is, the mines are revealed and the game is over.
+;	If these checks all pass, the cell is set to revealed. Next, the number
+;	of adjacent mines is checked. If it is zero, the cell is added to the
+;	stack-queue, and will later be chain-clicked.
+
+reveal_put_valid_cell:
+@check_revealed:
 	ldy #0
 	lda (cells_ptr), y
-	and #$40
-	beq @unrevealed
-	rts
-@unrevealed:
-click_cell_no_revealed_check:
-	lda (cells_ptr), y
 	and #$20
-	beq @not_flagged
+	beq @check_flagged
 	rts
-@not_flagged:
+@check_flagged:
+	lda (cells_ptr), y
+	and #$40
+	beq @check_mine
+	rts
+@check_mine:
 	lda (cells_ptr), y
 	and #$80
-	beq @not_mine
-	ora #$01
-	sta (cells_ptr), y
-	jsr reveal_mines
+	beq @set_revealed
+	jsr reveal_mines_flags
 	rts
-@not_mine:
+@set_revealed:
 	lda (cells_ptr), y
 	ora #$50
 	sta (cells_ptr), y
+	lda (cells_ptr), y
 	and #$0F
-	beq chain_click
-	rts
-chain_click:
+	bne @dont_put
+	jsr stack_queue_put
+@dont_put:
+	rts	
+	
+	
+; This routine is invoked from left_click_cell if it is called on a revealed
+;	cell. The routine first counts the number of adjacent flags using the
+;	abstract looping subroutine for_all_adjacent with the subroutine pointer
+;	set to check_flags_surrounding. The results are stored in the first
+;	scratch variable on the zero page. If these results equal the number
+;	of adjacent mines (stored in the lower four bits of the cell's state
+;	byte in the cells array), the current cell is placed in the stack-
+;	queue, the subroutine pointer is set to reveal_put_valid_cell, and
+;	execution is transferred directly to the last part of left_click_cell,
+;	where the adjacent cells are expanded. This setup is done directly here
+;	instead of in left_click_cell in order to bypass the revealed check in
+;	reveal_put_valid_cell, as the initial cell being expanded will already
+;	be revealed.
+
+click_surrounding:
 	lda #0
-	sta line_of_three
-	lda cursor_y
-	cmp #0
-	beq @first_row
-	dec cursor_y
-	jmp @check_row
-@first_row:
-	inc line_of_three
-@check_row:
-	lda line_of_three
-	cmp #3
-	bne @not_over
-	dec cursor_y
-	dec cursor_y
+	sta num_flags_adjacent
+	lda #<check_flags_surrounding
+	sta subroutine_ptr
+	lda #>check_flags_surrounding
+	sta subroutine_ptr+1
+	jsr for_all_surrounding
+	ldy #0
+	lda (cells_ptr), y
+	and #$0F
+	cmp num_flags_adjacent
+	bne @return
+	jsr stack_queue_put
+	lda #<reveal_put_valid_cell
+	sta subroutine_ptr
+	lda #>reveal_put_valid_cell
+	sta subroutine_ptr+1
+	jmp click_adjacent_cells
+@return:
 	rts
-@not_over:
-	cmp #2
-	bne @still_not_over
-	lda cursor_y
-	cmp #Y_RANGE
-	bne @still_not_over
-	dec cursor_y
+	
+	
+check_flags_surrounding:
+	ldy #0
+	lda (cells_ptr), y
+	and #$20
+	beq @end
+	inc num_flags_adjacent
+@end:
 	rts
-@still_not_over:
-	lda cursor_x
-	cmp #0
-	beq @middle_col
-	dec cursor_x
-	lda line_of_three
-	pha
-	jsr click_cells_recursive
-	pla
-	sta line_of_three
-	inc cursor_x
-@middle_col:
-	lda line_of_three
-	pha
-	jsr click_cells_recursive
-	pla
-	sta line_of_three
-	lda cursor_x
-	cmp #(X_RANGE-1)
-	beq @after_last_col
-	inc cursor_x
-	lda line_of_three
-	pha
-	jsr click_cells_recursive
-	pla
-	sta line_of_three
-	dec cursor_x
-@after_last_col:
-	inc cursor_y
-	inc line_of_three
-	jmp @check_row
 	
 	
 ; This routine is called when a mine is clicked and the game is lost. All mines
-;	are set to revealed, and the game_over flag is set.
+;	and flags are set to revealed, and the game_over flag is set to 0 for
+;	game over.
 	
-reveal_mines:
-	lda $D015
-	and #$FC
-	sta $D015
-	lda #1
+reveal_mines_flags:
+	jsr hide_sprites
+	lda #0
 	sta game_over
+	ldy #0
+	lda (cells_ptr), y
+	ora #$01
+	sta (cells_ptr), y
 	lda #<cells_array
 	sta cells_ptr
 	lda #>cells_array
 	sta cells_ptr+1
-	lda #0
-	sta current_line
-	sta current_col
 @loop:
-	ldy #0
-	lda (cells_ptr),y
+	cpy #TOTAL_CELLS
+	beq @end
+	lda (cells_ptr), y
 	and #$A0
-	cmp #$00
-	bne @process_this
-	jmp @next_cell
-@process_this:
+	beq @next_cell
 	lda (cells_ptr), y
 	ora #$50
 	sta (cells_ptr), y
 @next_cell:
-	jsr cells_ptr_right
-	inc current_col
-	lda current_col
-	cmp #X_RANGE
-	bne @go_back
-	lda #0
-	sta current_col
-	inc current_line
-	lda current_line
-	cmp #Y_RANGE
-	bne @go_back
-	rts
-@go_back:
+	iny
 	jmp @loop
-	
-
-; This routine is invoked from left_click_cell if it is called on a revealed
-;	cell. The routine first counts the number of adjacent flags, and if this
-;	number equals the number of mines adjacent to the cell, the surrounding
-;	cells are clicked. Reading through this now, I can tell that there is
-;	redundant code -- this will be removed in a later update.
-	
-click_surrounding:
-	lda #0
-	sta scratch
-	sta line_of_three
-	lda cursor_y
-	cmp #0
-	bne @back_one
-	inc line_of_three
-	jmp @process_line
-@back_one:
-	jsr cells_ptr_up
-@process_line:
-	lda cursor_x
-	cmp #0
-	beq @after_first
-	jsr cells_ptr_left
-	jsr check_flag
-	jsr cells_ptr_right
-@after_first:
-	jsr check_flag
-	lda cursor_x
-	cmp #(X_RANGE-1)
-	bne @do_last_col
-	jmp @to_next_ln
-@do_last_col:
-	jsr cells_ptr_right
-	jsr check_flag
-	jsr cells_ptr_left
-@to_next_ln:
-	lda line_of_three
-	cmp #2
-	bne @not_third
-	jsr cells_ptr_up
-	jmp @end
-@not_third:
-	cmp #0
-	beq @move_on
-	lda cursor_y
-	cmp #(Y_RANGE-1)
-	bne @move_on
-	jmp @end
-@move_on:
-	jsr cells_ptr_down
-	inc line_of_three
-	jmp @process_line
 @end:
-	ldy #0
-	lda (cells_ptr), y
-	and #$0F
-	cmp scratch
-	beq actually_click_surrounding
-@return:
 	rts
-actually_click_surrounding:
-	lda #0
-	sta line_of_three
-	lda cursor_y
-	cmp #0
-	beq @first_row
-	dec cursor_y
-	jmp @check_row
-@first_row:
-	inc line_of_three
-@check_row:
-	lda line_of_three
-	cmp #3
-	bne @not_over
-	dec cursor_y
-	dec cursor_y
-	rts
-@not_over:
-	cmp #2
-	bne @still_not_over
-	lda cursor_y
-	cmp #Y_RANGE
-	bne @still_not_over
-	dec cursor_y
-	rts
-@still_not_over:
-	lda cursor_x
-	cmp #0
-	beq @middle_col
-	dec cursor_x
-	lda line_of_three
-	pha
-	jsr click_cells_recursive
-	pla
-	sta line_of_three
-	inc cursor_x
-@middle_col:
-	lda line_of_three
-	pha
-	jsr click_cells_recursive
-	pla
-	sta line_of_three
-	lda cursor_x
-	cmp #(X_RANGE-1)
-	beq @after_last_col
-	inc cursor_x
-	lda line_of_three
-	pha
-	jsr click_cells_recursive
-	pla
-	sta line_of_three
-	dec cursor_x
-@after_last_col:
-	inc cursor_y
-	inc line_of_three
-	jmp @check_row
-@end:
-	ldy #0
-	lda (cells_ptr), y
-	and #$0F
-	cmp scratch
-	bne @return
-	jsr click_cell_no_revealed_check
-@return:
-	rts
+
+
+; Called after the first left click is made. These next several routines flow
+;	from one to another until the rts instruction is reached at the end of
+;	zero_mine_adjacencies. After this code is run, the board will be 
+;	populated with the correct number of mines in random locations with no
+;	mines adjacent to the cell that was clicked first. Avoiding this first-
+;	clicked cell ensures that the first click will always reveal more than
+;	one mine, limiting the chance that guessing will be required after only
+;	one click.
+
+
+; First, set up the subroutine pointer with the routine that will be used in
+;	the last step of the loop to increment adjacent mine counts of cells
+;	adjacent to each mine.
+
+initialize_mines:
+	lda #<inc_mine_count
+	sta subroutine_ptr
+	lda #>inc_mine_count
+	sta subroutine_ptr+1
 	
-	
-; Simply checks a cell for a flag and increments the scratch variable if it is
-;	found.
 
-check_flag:
-	ldy #0
-	lda (cells_ptr), y
-	and #$20
-	bne @flagged
-	rts
-@flagged:
-	inc scratch
-	rts
-
-
-; Places the appropriate number of mines on the board in random locations. Used
-;	to initialize the board after the first left click. The 3x3 area 
-;	surrounding the first click is avoided, as are already-existing mines.
+; Initialize mines_placed counter before the main loop.
 
 randomize_board:
 	lda #0
 	sta mines_placed
+	
+	
+; For each coordinate axis, a pseudorandom byte is generated. This byte is then
+;	decremented by the range of the axis until it is small enough to be a
+;	valid coordinate. In order to ensure that all coordinates occur with
+;	the same frequency (assuming equal frequency of pseudorandom bytes),
+;	the random byte is first compared to the greatest number modulo
+;	TOTAL_CELLS smaller than 256, and if it is greater than or equal to
+;	this value, a new random byte is generated.
+	
 get_randoms:
 get_rand_x:
 	lda RANDOM
@@ -1344,6 +1406,12 @@ get_rand_y:
 	jmp @loop
 @end:
 	tay
+	
+	
+; Next, the random coordinates are compared to the cursor coordinates. If the
+;	random coordinate pair falls inside the 3x3 area centered on the cursor,
+;	a new random coordinate pair is generated.
+	
 check_cursor:
 check_x:
 	inx
@@ -1369,178 +1437,83 @@ check_y:
 	bcs go_on
 	jmp get_randoms
 go_on:
+
+
+; This routine follows a similar pattern to set_cells_ptr_to_cursor, but uses
+;	the random coordinates stored in the x and y registers instead of the
+;	cursor values. When execution reaches the end, the cells array pointer
+;	will be set to the randomly-generated position.
+
 convert_addr:
 convert_y:
 	lda #<cells_array
 	sta cells_ptr
 	lda #>cells_array
 	sta cells_ptr+1
+	lda #0
+	sta current_line
+	sta current_col
 @loop:
 	cpy #0
 	beq @end
-	lda cells_ptr
-	clc
-	adc #X_RANGE
-	sta cells_ptr
-	lda cells_ptr+1
-	adc #0
-	sta cells_ptr+1
+	jsr cells_ptr_down
+	inc current_line
 	dey
 	jmp @loop
 @end:
 convert_x:
-	stx scratch
-	lda cells_ptr
-	clc
-	adc scratch
-	sta cells_ptr
-	lda cells_ptr+1
-	adc #0
-	sta cells_ptr+1
+@loop:
+	cpx #0
+	beq @end
+	jsr cells_ptr_right
+	inc current_col
+	dex
+	jmp @loop
+@end:
+	
+		
+; Finally, this routine checks if the random position is already a mine. If it
+;	is, a new random position is generated. If it is not, the cell is set to
+;	a mine, the number of adjacent mines is set to zero, the variable
+;	storing the number of mines already placed is incremented, and the
+;	for_all_surrounding subroutine is called with inc_mine_count in the
+;	subroutine pointer to increment the adjacent mine counts of the cells
+;	adjacent to the new mine. If all mines have been placed, board
+;	initialiation is finished.
+	
 check_mine:
 	ldy #0
 	lda (cells_ptr),y
 	and #$80
-	cmp #0
 	bne @go_back
 	lda (cells_ptr),y
 	ora #$80
+	and #$F0
 	sta (cells_ptr),y
 	inc mines_placed
+	jsr for_all_surrounding
 	lda mines_placed
 	cmp #MINES
-	bne @go_back
-	rts
+	beq @end
 @go_back:
 	jmp get_randoms
+@end:
+	rts
 	
-	
-; Increments the mine count of all cells surrounding each mine.
+
+; Called from for_all_surrounding. If the cell is not a mine, increment its
+;	count of adjacent mines. If it is a mine, do nothing.
 	
 inc_mine_count:
-	lda (cells_ptr),y
-	tax
-	inx
-	txa
-	sta (cells_ptr),y
-	rts
-	
-count_adjacent:
-	lda #0
-	sta line_of_three
-	lda #<cells_array
-	sta cells_ptr
-	lda #>cells_array
-	sta cells_ptr+1
-	lda #0
-	sta current_line
-	sta current_col
-@loop:
-	ldy #0
-	lda (cells_ptr),y
-	and #$80
-	cmp #$00
-	bne @process_this
-	jmp @next_cell
-@process_this:
-	lda #0
-	sta line_of_three
-	lda current_line
-	cmp #0
-	bne @back_one
-	inc line_of_three
-	jmp @process_line
-@back_one:
-	jsr cells_ptr_up
-@process_line:
-	lda current_col
-	cmp #0
-	beq @after_first
-	jsr cells_ptr_left
-	jsr inc_mine_count
-	jsr cells_ptr_right
-@after_first:
-	jsr inc_mine_count
-	lda current_col
-	cmp #(X_RANGE-1)
-	bne @do_last_col
-	jmp @to_next_ln
-@do_last_col:
-	jsr cells_ptr_right
-	jsr inc_mine_count
-	jsr cells_ptr_left
-@to_next_ln:
-	lda line_of_three
-	cmp #2
-	bne @not_third
-	jsr cells_ptr_up
-	jmp @next_cell
-@not_third:
-	cmp #0
-	beq @move_on
-	lda current_line
-	cmp #(Y_RANGE-1)
-	bne @move_on
-	jmp @next_cell
-@move_on:
-	jsr cells_ptr_down
-	inc line_of_three
-	jmp @process_line
-@next_cell:
-	jsr cells_ptr_right
-	inc current_col
-	lda current_col
-	cmp #X_RANGE
-	bne @go_back
-	lda #0
-	sta current_col
-	inc current_line
-	lda current_line
-	cmp #Y_RANGE
-	bne @go_back
-	jmp zero_mine_adjacencies
-@go_back:
-	jmp @loop
-	
-	
-; Zeroes out the adjacent mines count for all mine-cells. This count is only
-;	relevant for non-mine cells, and one of the bits in the cell state byte
-;	is used to flag the mine that was clicked when the game is lost.
-
-zero_mine_adjacencies:
-	lda #<cells_array
-	sta cells_ptr
-	lda #>cells_array
-	sta cells_ptr+1
-	lda #0
-	sta current_line
-	sta current_col
-@loop:
-	ldy #0
-	lda (cells_ptr),y
-	and #$80
-	cmp #$00
-	bne @process_this
-	jmp @next_cell
-@process_this:
 	lda (cells_ptr), y
-	and #$F0
-	sta (cells_ptr), y
-@next_cell:
-	jsr cells_ptr_right
-	inc current_col
-	lda current_col
-	cmp #X_RANGE
-	bne @go_back
-	lda #0
-	sta current_col
-	inc current_line
-	lda current_line
-	cmp #Y_RANGE
-	bne @go_back
+	and #$80
+	bne @end
+	lda (cells_ptr), y
+	clc
+	adc #1
+	sta (cells_ptr),y
+@end:
 	rts
-@go_back:
-	jmp @loop
 	
 
 ; This routine draws the board in bitmap memory, only updating cells with the
@@ -1568,7 +1541,7 @@ draw_board:
 	lda (cells_ptr), y
 	and #$10
 	beq @advance
-	jsr draw_cell
+	jsr draw_board_cell
 @advance:
 	jsr cells_ptr_right
 	jsr color_ptr_right
@@ -1592,30 +1565,48 @@ draw_board:
 	rts
 	
 
-; Draws one individual cell.
+; Draws one board cell, using the pointers and variables set above.
 	
-draw_cell:
+draw_board_cell:
 	ldy #0
 	lda (cells_ptr), y
 	and #$EF
 	sta (cells_ptr), y
 	jsr identify_cell
-	jsr draw_one_cell
+	jsr draw_one_graphics_cell
 	jsr bitmap_ptr_right
 	jsr color_ptr_right
 	jsr graphics_ptr_right
-	jsr draw_one_cell
+	jsr draw_one_graphics_cell
 	jsr bitmap_ptr_down
 	jsr color_ptr_down
 	jsr graphics_ptr_down
-	jsr draw_one_cell
+	jsr draw_one_graphics_cell
 	jsr bitmap_ptr_left
 	jsr color_ptr_left
 	jsr graphics_ptr_left
-	jsr draw_one_cell
+	jsr draw_one_graphics_cell
 	jsr bitmap_ptr_up
 	jsr color_ptr_up
 	jsr graphics_ptr_up
+	rts
+	
+	
+; Draws one individual 8x8 graphics cell, using the pointers and variables set
+;	above.
+	
+draw_one_graphics_cell:
+	lda current_color
+	ldy #0
+	sta (color_ptr), y
+@loop:
+	cpy #8
+	beq @end
+	lda (graphics_ptr), y
+	sta (bitmap_ptr), y
+	iny
+	jmp @loop
+@end:
 	rts
 	
 	
@@ -1632,7 +1623,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>unrevealed
 	sta graphics_ptr+1
-	lda #$0F
+	lda #LIGHT_GRAY
+	and #$0F
 	sta current_color
 	rts
 @flagged:
@@ -1644,10 +1636,12 @@ identify_cell:
 	and #$C0
 	cmp #$40
 	beq @false_flag
-	lda #$0F
+	lda #LIGHT_GRAY
+	and #$0F
 	jmp @after_color
 @false_flag:
-	lda #$02
+	lda #DARK_RED
+	and #$0F
 @after_color:
 	sta current_color
 	rts
@@ -1662,23 +1656,25 @@ identify_cell:
 	lda (cells_ptr), y
 	and #$0F
 	bne @exploded
-	lda #$0C
+	lda #MID_GRAY
+	and #$0F
 	jmp @after
 @exploded:
-	lda #$02
+	lda #DARK_RED
+	and #$0F
 @after:
 	sta current_color
 	rts
 @not_mine:
 	lda (cells_ptr), y
 	and #$0F
-	cmp #0
 	bne @not_zero
 	lda #<revealed_0
 	sta graphics_ptr
 	lda #>revealed_0
 	sta graphics_ptr+1
-	lda #$0C
+	lda #MID_GRAY
+	and #$0F
 	sta current_color
 	rts
 @not_zero:
@@ -1688,7 +1684,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_1
 	sta graphics_ptr+1
-	lda #$0E
+	lda #LIGHT_BLUE
+	and #$0F
 	sta current_color
 	rts
 @not_one:
@@ -1698,7 +1695,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_2
 	sta graphics_ptr+1
-	lda #$05
+	lda #GREEN
+	and #$0F
 	sta current_color
 	rts
 @not_two:
@@ -1708,7 +1706,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_3
 	sta graphics_ptr+1
-	lda #$0A
+	lda #LIGHT_RED
+	and #$0F
 	sta current_color
 	rts
 @not_three:
@@ -1718,7 +1717,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_4
 	sta graphics_ptr+1
-	lda #$06
+	lda #DARK_BLUE
+	and #$0F
 	sta current_color
 	rts
 @not_four:
@@ -1728,7 +1728,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_5
 	sta graphics_ptr+1
-	lda #$02
+	lda #DARK_RED
+	and #$0F
 	sta current_color
 	rts
 @not_five:
@@ -1738,7 +1739,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_6
 	sta graphics_ptr+1
-	lda #$03
+	lda #CYAN
+	and #$0F
 	sta current_color
 	rts
 @not_six:
@@ -1748,7 +1750,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_7
 	sta graphics_ptr+1
-	lda #$08
+	lda #ORANGE
+	and #$0F
 	sta current_color
 	rts
 @not_seven:
@@ -1756,7 +1759,8 @@ identify_cell:
 	sta graphics_ptr
 	lda #>revealed_8
 	sta graphics_ptr+1
-	lda #$09
+	lda #BROWN
+	and #$0F
 	sta current_color
 	rts
 	
@@ -2246,26 +2250,5 @@ flag:
 .byte %00000000
 .byte %00000000
 
-
-; ******************************************************************************
-; * Cells Array                                                                *
-; ******************************************************************************
-
-
-; This simple label defines the start of the cell state bytes array, as I
-;	couldn't figure out how to reserve a specific number of bytes in memory
-;	using the cc65 assembler macros without providing values for each 
-;	individual byte.
-
-; The functions of the bits in a state byte are as follows:
-;	Bit 7: Set if the cell is a mine.
-;	Bit 6: Set if the cell is flagged.
-;	Bit 5: Set if the cell is revealed.
-;	Bit 4: Set if the cell has been updated since it was last drawn.
-;	Bits 3-0: Store the integer number of mines adjacent to this cell (0-8).
-;	Bit 0: If the cell is a mine, bit 0 is set if this specific cell was the
-;		one clicked on by the player to lose the game.
-
-cells_array:
-
+after_graphics:
 
