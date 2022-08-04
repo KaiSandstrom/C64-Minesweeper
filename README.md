@@ -7,13 +7,10 @@ different, and started working on a 6502 assembly version of Minesweeper for the
 Commodroe 64. The first version of this program here was completed in about 
 three days.
 
-In its current state, the code is a bit of an unoptimized mess with little
-documentation. In the coming commits, I hope to clean it up substantially and
-add explanatory comments throughout. Some specific ideas I have are 
-consolidation of scratch memory addresses into a few zero page locations,
-removal of redundant looping code and replacement with relative jumps to the
-necessary operation, and switching to a redefined character mode instead of
-bitmap mode.
+Future plans include:
+- More detailed info/instructions screens across multiple text pages
+- Game info screen with mine count and clock updated by interrupt service routine
+- Switch to using redefined characters instead of bitmapped graphics
 
 This last point in particular will simplify a lot of code. For whatever reason,
 I didn't consider redefining the character set when making this program and
