@@ -10,11 +10,9 @@ in about three days, and much more work has been done since.
 In its current state, C64-Minesweeper supports one board size and difficulty --
 a 12x24 board with 40 mines. 
 
-I may add support for custom numbers of mines in the near future. Custom board 
-sizes would be limited to those smaller than 12x24 due to graphical limitations 
-and would require extra code to fill in the remainder of the board with blank 
-characters and update their color when needed, so this update is unlikely, but I
-won't rule it out entirely.
+Future plans include:
+- Compression of whitespace in text screen data
+- (Possibly) Add support for custom difficulties (number of mines)
 
 ## Building from source
 Use the [cc65](https://cc65.github.io/) assembler, cl65, to build the C64
