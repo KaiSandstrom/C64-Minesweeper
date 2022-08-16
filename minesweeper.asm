@@ -145,10 +145,10 @@ subroutine_ptr = $C1
 interrupt_service_prev = $57
 
 
-; Initialized to 0 at the start of a game. At each interrupt, if the game is
-;	active, the clock is incremented. When it reaches 60, meaning that one
-;	second has elapsed, it is reset to 0 and the characters at 
-;	SECONDS_CLOCK are updated.
+; Initialized to IRQ_PER_SECOND at the start of a game. At each interrupt, if
+;	the game is active, the clock is decremented. When it reaches 0,
+;	meaning that one second has elapsed, it is reset to IRQ_PER_SECOND and
+;	the characters at SECONDS_CLOCK are updated.
 interrupts_clock = $52
 
 ; ******************************************************************************
@@ -2218,7 +2218,7 @@ details_two:
 .byte "no mines will be placed adjacent to the "
 .byte "location of your first clear operation. "
 .byte "                                        "
-.byte "use the f key to flag a hidden cell or  "
+.byte "use the e key to flag a hidden cell or  "
 .byte "unflag a flagged cell. a cleared cell   "
 .byte "cannot be flagged, and a flagged cell   "
 .byte "cannot be cleared.                      "
