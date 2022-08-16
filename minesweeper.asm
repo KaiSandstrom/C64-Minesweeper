@@ -5,8 +5,8 @@
 .segment "CODE"
 
 
-; Initial program execution begins with loading the intro screen.
-	jmp show_intro_screen
+; Jump to the location of initial program execution
+	jmp start
 
 
 ;*******************************************************************************
@@ -14,13 +14,18 @@
 ;*******************************************************************************
 
 
-; C64 graphics addresses and built-in routines. Some are only used during 
-; 	initial startup, but are defined here for the sake of readability.
+; C64 graphics addresses and built-in routines, as well as some program-defined
+;	locations. Some are only used during initial startup, but are defined
+;	here for the sake of readability.
 
 
 ; Keyboard I/O
-GETCHAR = $FFE4
-PUTCHAR = $FFD2
+CHROUT = $FFE4
+
+
+; Interrupt-handling
+IRQ_VECTOR     = $0314
+IRQ_PER_SECOND = 60
 
 
 ; SID chip addresses used for pseudorandom number generation
@@ -31,25 +36,25 @@ RANDOM          = $D41B
 
 
 ; Video mode and video memory constants
-FRAME_COLOR         = $D020
-BACKGROUND_COLOR    = $D021
-V_MODE_CTRL         = $D011
-VIC_BANK_SELECT     = $DD00
-V_MEMORY_LOCATION   = $D018
-COLOR               = $4000
-BITMAP              = $6000
-MODE_CLEAR_MASK     = $FC
-MODE_BITMAP_MASK    = $02
-MODE_TEXT_MASK      = $03
-BITMAP_MEM_LOCATION = $08
-TEXT_MEM_LOCATION   = $14
-V_MODE_BITMAP_MASK  = $20
-V_MODE_TEXT_MASK    = $DF
+FRAME_COLOR        = $D020
+BACKGROUND_COLOR   = $D021
+VIC_BANK_SELECT    = $DD00
+VIC_MEM_CTRL       = $D018
+VIC_SCREEN_CTRL    = $D011
+CHAR_ROM_START     = $D000
+COLOR              = $D800
+CHAR_CUSTOM_SYMBS  = $4000
+CHAR_CUSTOM_GRAPH  = $4200
+SCREEN_BOARD       = $4800
+SCREEN_SPLASH      = $4C00
+SCREEN_GAMESTATS   = $5000
+SCREEN_HOWTO_1     = $5400
+SCREEN_HOWTO_2     = $5800
+SCREEN_HOWTO_3     = $5C00
+BOARD_COLOR_BCKUP  = $7800
 
 
 ; Color value constants
-; For bitmap graphics, these values will be ANDed with $0F to set the color of
-;	graphics cells' 1 bits to black, and the 0 bits to the relevant color.
 BLACK      = $00
 WHITE      = $11
 LIGHT_GRAY = $FF
@@ -64,6 +69,7 @@ GREEN      = $55
 BROWN      = $99
 ORANGE     = $88
 
+
 ; Sprite addresses and constants
 INNER_SPRITE_X        = $D000
 INNER_SPRITE_Y        = $D001
@@ -71,16 +77,18 @@ OUTER_SPRITE_X        = $D002
 OUTER_SPRITE_Y        = $D003
 SPRITES_X_MSB         = $D010
 INNER_SPRITE_LOCATION = $4400
-OUTER_SPRITE_LOCATION = $5000
-INNER_SPRITE_OFFSET   = 16
-OUTER_SPRITE_OFFSET   = 64
-INNER_SPRITE_POINTER  = $43F9
-OUTER_SPRITE_POINTER  = $43F8
+OUTER_SPRITE_LOCATION = $4440
+INNER_SPRITE_POINTER  = $4BF9
+OUTER_SPRITE_POINTER  = $4BF8
 INNER_SPRITE_COLOR    = $D027
 OUTER_SPRITE_COLOR    = $D028
 SHOW_SPRITES_REG      = $D015
-SHOW_SPRITES_MASK     = $03
-HIDE_SPRITES_MASK     = $FC
+
+
+; Status screen counter addresses
+SECONDS_CLOCK = SCREEN_GAMESTATS+624
+MINES_LEFT    = SCREEN_GAMESTATS+504
+
 
 ; Game constants
 X_RANGE     = 20
@@ -100,22 +108,22 @@ game_over = $02
 
 
 ; $03 and $04 are scratch variables, used for several purposes.
-scratch        = $03
-mines_placed   = scratch
-line_of_three  = scratch+1
-current_color  = scratch
-num_flags      = scratch
+scratch       = $03
+mines_placed  = scratch
+board_updated = scratch
+line_of_three = scratch+1
+current_color = scratch
+num_flags     = scratch
 
 
-; Stores the position of the cursor on-screen. 
+; Stores the position of the cursor on-screen, in board tiles. 
 cursor_x = $05
 cursor_y = $06
 
 
-; These store line and column indexes for iterating through the board. Since in
-;	some applications (such as graphics processing) each cell is represented
-;	by multiple bytes, these provide an easy way to tell when line breaks
-;	occur, as well as when the final cell has been processed.
+; These store line and column indexes for iterating through the board. 
+;	These are used instead of indirect indexing when graphics are being
+;	manipulated and when a cell's neighbors need to be processed.
 current_line = $9B
 current_col  = $9C
 
@@ -123,8 +131,8 @@ current_col  = $9C
 ; Pointers into various memory locations used in the representation of cells.
 cells_ptr       = $FB
 color_ptr       = $FD
-bitmap_ptr      = $F7
-graphics_ptr    = $F9
+g_dest_ptr      = $F7
+g_src_ptr       = $F9
 stack_queue_ptr = $BB
 
 
@@ -132,6 +140,16 @@ stack_queue_ptr = $BB
 ;	through adjacent cells performing an abstract task.
 subroutine_ptr = $C1
 
+
+; Stores the value of the IRQ vector $0314-5 when the program is first loaded
+interrupt_service_prev = $57
+
+
+; Initialized to 0 at the start of a game. At each interrupt, if the game is
+;	active, the clock is incremented. When it reaches 60, meaning that one
+;	second has elapsed, it is reset to 0 and the characters at 
+;	SECONDS_CLOCK are updated.
+interrupts_clock = $52
 
 ; ******************************************************************************
 ; * Cells Array                                                                *
@@ -145,8 +163,8 @@ subroutine_ptr = $C1
 
 ; The functions of the bits in a state byte are as follows:
 ;	Bit 7: Set if the cell is a mine.
-;	Bit 6: Set if the cell is flagged.
-;	Bit 5: Set if the cell is revealed.
+;	Bit 6: Set if the cell is revealed.
+;	Bit 5: Set if the cell is flagged.
 ;	Bit 4: Set if the cell has been updated since it was last drawn.
 
 ;	If the cell is not a mine (bit 7 is clear):
@@ -203,27 +221,21 @@ stack_queue = (after_graphics+TOTAL_CELLS)
 
 
 ; These four routines adjust the position of a pointer into the cell state 
-;	array. Each cell is represented by one byte. The bit format of this
-;	state byte is explained with the cell array definition.
+;	array. Each cell is represented by one byte as explained above.
 
 cells_ptr_right:
-	lda cells_ptr
-	clc
-	adc #1
-	sta cells_ptr
-	lda cells_ptr+1
-	adc #0
-	sta cells_ptr+1
+	inc cells_ptr
+	bne @end
+	inc cells_ptr+1
+@end:
 	rts
 	
 cells_ptr_left:
 	lda cells_ptr
-	sec
-	sbc #1
-	sta cells_ptr
-	lda cells_ptr+1
-	sbc #0
-	sta cells_ptr+1
+	bne @dec_l
+	dec cells_ptr+1
+@dec_l:
+	dec cells_ptr
 	rts
 	
 cells_ptr_up:
@@ -249,75 +261,79 @@ cells_ptr_down:
 ; ------------------------------------------------
 
 
-; Bitmap pointer manipulation routines: Adjust the position of the pointer into
-;	bitmap screen memory by line and column.	
+; Graphics pointer manipulation routines: Adjust the position of a pointer
+;	into text screen memory by cell line and column. These are only used
+;	when populating the game board screen with graphics characters.
 
-bitmap_ptr_right:
-	lda bitmap_ptr
+g_dest_ptr_right:
+	inc g_dest_ptr
+	bne @end
+	inc g_dest_ptr+1
+@end:
+	rts
+	
+g_dest_ptr_left:
+	lda g_dest_ptr
+	bne @dec_l
+	dec g_dest_ptr+1
+@dec_l:
+	dec g_dest_ptr
+	rts
+	
+	
+g_dest_ptr_down:
+	lda g_dest_ptr
 	clc
-	adc #8
-	sta bitmap_ptr
-	lda bitmap_ptr+1
+	adc #(X_RANGE*2)
+	sta g_dest_ptr
+	lda g_dest_ptr+1
 	adc #0
-	sta bitmap_ptr+1
+	sta g_dest_ptr+1
 	rts
 	
-bitmap_ptr_left:
-	lda bitmap_ptr
+g_dest_ptr_up:
+	lda g_dest_ptr
 	sec
-	sbc #8
-	sta bitmap_ptr
-	lda bitmap_ptr+1
+	sbc #(X_RANGE*2)
+	sta g_dest_ptr
+	lda g_dest_ptr+1
 	sbc #0
-	sta bitmap_ptr+1
-	rts
-	
-bitmap_ptr_down:
-	inc bitmap_ptr+1
-	lda bitmap_ptr
-	clc
-	adc #64
-	sta bitmap_ptr
-	lda bitmap_ptr+1
-	adc #0
-	sta bitmap_ptr+1
-	rts
-	
-bitmap_ptr_up:
-	dec bitmap_ptr+1
-	lda bitmap_ptr
-	sec
-	sbc #64
-	sta bitmap_ptr
-	lda bitmap_ptr+1
-	sbc #0
-	sta bitmap_ptr+1
+	sta g_dest_ptr+1
 	rts
 	
 ; ------------------------------------------------
 
 
-; Color pointer manipulation routines: Adjust a pointer into screen memory,
-;	which is used to store color information in bitmap mode.
+; Simply increment the graphics source pointer. Like the earlier set of
+;	routines, this is only used when drawing cells on the board screen, and
+;	and due to the way the set of character screen codes for each cell is
+;	stored, no other manipulation is needed.
+
+g_src_ptr_advance:
+	inc g_src_ptr
+	bne @end
+	inc g_src_ptr+1
+@end:
+	rts
+	
+; ------------------------------------------------
+
+; Color pointer manipulation routines: Adjust a pointer into color memory for
+;	text mode. Used when drawing cells on the board.
 	
 color_ptr_right:
-	lda color_ptr
-	clc
-	adc #1
-	sta color_ptr
-	lda color_ptr+1
-	adc #0
-	sta color_ptr+1
+	inc color_ptr
+	bne @end
+	inc color_ptr+1
+@end:
 	rts
 	
 color_ptr_left:
 	lda color_ptr
-	sec
-	sbc #1
-	sta color_ptr
-	lda color_ptr+1
-	sbc #0
-	sta color_ptr+1
+	bne @dec_l
+	dec color_ptr+1
+@dec_l:
+	dec color_ptr
 	rts
 	
 color_ptr_down:
@@ -340,56 +356,6 @@ color_ptr_up:
 	sta color_ptr+1
 	rts
 	
-; ------------------------------------------------
-
-
-; Graphics pointer manipulation routines: These adjust a pointer between the
-;	four 8x8 graphics cells that make up one 16x16 board cell. The four
-;	sub-cells are defined in the order top-left, top-right, bottom-left,
-;	bottom-right. These routines adjust the pointer between these four 
-;	locations, in the order top-left -> top-right -> bottom-right -> 
-;	bottom-left -> top-left, given that the pointer starts in the top-left
-;	position.
-	
-graphics_ptr_right:
-	lda graphics_ptr
-	clc
-	adc #8
-	sta graphics_ptr
-	lda graphics_ptr+1
-	adc #0
-	sta graphics_ptr+1
-	rts
-	
-graphics_ptr_left:
-	lda graphics_ptr
-	sec
-	sbc #8
-	sta graphics_ptr
-	lda graphics_ptr+1
-	sbc #0
-	sta graphics_ptr+1
-	rts
-	
-graphics_ptr_down:
-	lda graphics_ptr
-	clc
-	adc #16
-	sta graphics_ptr
-	lda graphics_ptr+1
-	adc #0
-	sta graphics_ptr+1
-	rts
-	
-graphics_ptr_up:
-	lda graphics_ptr
-	sec
-	sbc #16
-	sta graphics_ptr
-	lda graphics_ptr+1
-	sbc #0
-	sta graphics_ptr+1
-	rts
 	
 ; ------------------------------------------------
 
@@ -399,9 +365,7 @@ graphics_ptr_up:
 	
 cursor_left:
 	lda cursor_x
-	bne @move
-	rts
-@move:
+	beq @return
 	dec cursor_x
 	lda OUTER_SPRITE_X
 	sec
@@ -411,20 +375,17 @@ cursor_left:
 	sec
 	sbc #16
 	sta INNER_SPRITE_X
-	bcc @set_msb
-	rts
-@set_msb:
+	bcs @return
 	lda #$00
 	sta SPRITES_X_MSB
+@return:
 	rts
 	
 	
 cursor_right:
 	lda cursor_x
 	cmp #(X_RANGE-1)
-	bne @move
-	rts
-@move:
+	beq @return
 	inc cursor_x
 	lda OUTER_SPRITE_X
 	clc
@@ -434,18 +395,15 @@ cursor_right:
 	clc
 	adc #16
 	sta INNER_SPRITE_X
-	bcs @set_msb
-	rts
-@set_msb:
+	bcc @return
 	lda #$03
 	sta SPRITES_X_MSB
+@return:
 	rts
 	
 cursor_up:
 	lda cursor_y
-	bne @move
-	rts
-@move:
+	beq @return
 	dec cursor_y
 	lda OUTER_SPRITE_Y
 	sec
@@ -455,15 +413,14 @@ cursor_up:
 	sec
 	sbc #16
 	sta INNER_SPRITE_Y
+@return:
 	rts
 	
 	
 cursor_down:
 	lda cursor_y
 	cmp #(Y_RANGE-1)
-	bne @move
-	rts
-@move:
+	beq @return
 	inc cursor_y
 	lda OUTER_SPRITE_Y
 	clc
@@ -473,6 +430,7 @@ cursor_down:
 	clc
 	adc #16
 	sta INNER_SPRITE_Y
+@return:
 	rts
 
 ; ------------------------------------------------
@@ -536,6 +494,11 @@ stack_queue_get:
 ;	this subroutine performs an abstract task on each of the cells adjacent
 ;	to the original. The address of the abstract task's subroutine is loaded
 ;	into the subroutine pointer before this routine is called.
+
+; The cells array pointer is returned to the center after each cell in a row is
+;	processed. This is inefficient, but was done in order to handle
+;	potential collisions with the edge of the board. This routine may
+;	eventually be rewritten with a less clunky solution.
 
 for_all_surrounding:
 	lda #0
@@ -603,117 +566,400 @@ do_task:
 	
 
 ; *********** Other Common Subroutines ***********
+
+
+; This routine is tacked onto the beginning of the existing interupt service
+;	routine, which fires 60 times per second on an NTSC machine. Its purpose
+;	is to update the timer that keeps track of the number of seconds since
+;	the start of the current game -- If the game is in-progress, a counter
+;	is incremented, and when it hits 60, the timer display is updated. If
+;	the timer reaches 999, it stops updating.
+
+interrupt_service_extension:
+	lda game_over
+	cmp #1
+	bne @to_prev_irq
+	dec interrupts_clock
+	bne @to_prev_irq
+	lda #IRQ_PER_SECOND
+	sta interrupts_clock
+	lda SECONDS_CLOCK
+	cmp #$39
+	bne @update_seconds_clock
+	lda SECONDS_CLOCK+1
+	cmp #$39
+	bne @update_seconds_clock
+	lda SECONDS_CLOCK+2
+	cmp #$39
+	beq @to_prev_irq
+@update_seconds_clock:
+	inc SECONDS_CLOCK+2
+	lda #$3A
+	cmp SECONDS_CLOCK+2
+	bne @to_prev_irq
+	lda #$30
+	sta SECONDS_CLOCK+2
+	inc SECONDS_CLOCK+1
+	lda #$3A
+	cmp SECONDS_CLOCK+1
+	bne @to_prev_irq
+	lda #$30
+	sta SECONDS_CLOCK+1
+	inc SECONDS_CLOCK
+@to_prev_irq:
+	jmp (interrupt_service_prev)
 	
 
-; These routines show and hide the two sprites that make up the cursor,
+; These two routines show and hide the two sprites that make up the cursor,
 ;	respectively.
 
 show_sprites:
 	lda SHOW_SPRITES_REG
-	ora #SHOW_SPRITES_MASK
+	ora #$03
 	sta SHOW_SPRITES_REG
 	rts
 
+
 hide_sprites:
 	lda SHOW_SPRITES_REG
-	and #HIDE_SPRITES_MASK
+	and #$FC
 	sta SHOW_SPRITES_REG
+	rts
+	
+
+; These two routines show and hide the screen. Used when updating the color RAM
+;	when screens are switched, in order to avoid briefly showing incorrect
+;	colors.
+
+show_screen:
+	lda VIC_SCREEN_CTRL
+	ora #$10
+	sta VIC_SCREEN_CTRL
+	rts
+	
+	
+hide_screen:
+	lda VIC_SCREEN_CTRL
+	and #$EF
+	sta VIC_SCREEN_CTRL
+	rts
+	
+	
+; Simply wait for any key to be pressed.
+
+await_input:
+	jsr CHROUT
+	beq await_input
 	rts
 	
 	
 ; Since the game board only uses 24 out of 25 rows, the final row of the screen
-;	must be filled in with the frame color. This routine performs this 
-;	action using the color stored in the current_color variable.
+;	is filled in with full-block characters. This routine sets the color
+;	RAM of these characters to match the frame color, which is stored in
+;	current_color.
 	
 draw_last_strip:
-	lda #<COLOR
-	clc
-	adc #192
-	sta color_ptr
 	lda #>COLOR
+	clc
 	adc #3
 	sta color_ptr+1
+	lda #<COLOR
+	adc #192
+	sta color_ptr
 	lda current_color
+	ldy #(X_RANGE*2)
+@loop:
+	sta (color_ptr), y
+	dey
+	bpl @loop
+@end:
+	rts
+	
+
+; Sets up color RAM and VIC to display the intro/splash screen and waits for
+;	input.
+	
+show_intro_screen:
+	jsr fill_color_white
+	lda #MID_GRAY
+	sta COLOR+4
+	sta COLOR+5
+	sta COLOR+34
+	sta COLOR+35
+	sta COLOR+44
+	sta COLOR+45
+	sta COLOR+74
+	sta COLOR+75
+	lda VIC_MEM_CTRL
+	and #$01
+	ora #$30
+	sta VIC_MEM_CTRL
+	jsr show_screen
+	jsr await_input
+	jsr hide_screen
+	lda game_over
+	beq @keep_sprites_hidden
+	jsr show_sprites
+@keep_sprites_hidden:
+	rts
+	
+	
+; Used when showing the intro/splash screen with the I key. Does additional
+;	graphics processing unnecessary when showing this screen for the
+;	first time, including showing the board again when dismissed.
+
+show_intro_again:
+	lda FRAME_COLOR
+	sta current_color
+	lda #BLACK
+	sta FRAME_COLOR
+	jsr hide_sprites
+	jsr hide_screen
+	jsr backup_board_color
+	jsr show_intro_screen
+	lda current_color
+	sta FRAME_COLOR
+	jsr show_board
+	rts
+	
+	
+; Shows the three screens of the "how to play" text, one after the other in
+;	order, waiting for user input in between.
+	
+show_howto_screen:
+	lda FRAME_COLOR
+	sta current_color
+	lda #BLACK
+	sta FRAME_COLOR
+	jsr hide_sprites
+	jsr hide_screen
+	jsr fill_color_white
+	lda VIC_MEM_CTRL
+	and #$01
+	ora #$50
+	sta VIC_MEM_CTRL
+	jsr show_screen
+	jsr await_input
+	lda VIC_MEM_CTRL
+	and #$01
+	ora #$60
+	sta VIC_MEM_CTRL
+	jsr await_input
+	lda VIC_MEM_CTRL
+	and #$01
+	ora #$70
+	sta VIC_MEM_CTRL
+	jsr await_input
+	jsr hide_screen
+	lda game_over
+	beq @keep_sprites_hidden
+	jsr show_sprites
+@keep_sprites_hidden:
+	lda current_color
+	sta FRAME_COLOR
+	jmp show_board
+
+
+; Shows the game stats screen, placing the correct characters in the "mines
+;	minus flags" line each time it's called.	
+	
+show_status_screen:
+	lda FRAME_COLOR
+	sta current_color
+	jsr backup_board_color
+	lda #BLACK
+	sta FRAME_COLOR
+	jsr hide_sprites
+	jsr hide_screen
+	jsr fill_color_white
+	lda VIC_MEM_CTRL
+	and #$01
+	ora #$40
+	sta VIC_MEM_CTRL
+	jsr set_flags_count
+	jsr show_screen
+	jsr await_input
+	jsr hide_screen
+	lda game_over
+	beq @keep_sprites_hidden
+	jsr show_sprites
+@keep_sprites_hidden:
+	lda current_color
+	sta FRAME_COLOR
+	
+	
+; Switches the VIC to show the game board, retrieving the board's color info
+;	from the backup page and placing it in color RAM.
+	
+show_board:
+	lda #<BOARD_COLOR_BCKUP
+	sta g_src_ptr
+	lda #>BOARD_COLOR_BCKUP
+	sta g_src_ptr+1
+	lda #<COLOR
+	sta g_dest_ptr
+	lda #>COLOR
+	sta g_dest_ptr+1
+	jsr copy_screen_ram
+	jsr draw_last_strip
+	lda VIC_MEM_CTRL
+	and #$01
+	ora #$20
+	sta VIC_MEM_CTRL
+	jsr show_screen
+	rts
+	
+
+; Copies 1K of memory from the location in g_src_ptr to the location in
+;	g_dest_ptr, performing the task at the address stored in subroutine_ptr
+;	for each byte.
+	
+copy_screen_inner:
+	ldx #0
 	ldy #0
 @loop:
-	cpy #(X_RANGE*2)
+	lda (g_src_ptr), y
+	jsr do_task
+	sta (g_dest_ptr), y
+	iny
+	bne @loop
+	inc g_src_ptr+1
+	inc g_dest_ptr+1
+	inx
+	cpx #4
+	bne @loop
+	rts
+	
+
+; Convert a PETSCII code to a screen RAM code
+
+convert_screen_code:
+	cmp #$40
+	bcc @no_change
+	cmp #$60
+	bcs @no_change
+	clc
+	adc #$C0
+@no_change:
+	rts
+	
+	
+; Nothing. The purpose of this subroutine is as an empty value in the
+;	subroutine pointer as an alternative to convert_screen_code when not
+;	copying text.
+
+no_op:
+	rts
+	
+	
+; Simply copy the bytes using copy_screen_inner -- place no_op in subroutine_ptr
+	
+copy_screen_ram:
+	lda #<no_op
+	sta subroutine_ptr
+	lda #>no_op
+	sta subroutine_ptr+1
+	jmp copy_screen_inner
+	
+	
+; Load convert_screen_code into subroutine_ptr and call copy_screen_inner. This
+;	is used to copy a text screen into memory. The text is stored as
+;	ASCII/PETSCII for the sake of convenience, so the values must be
+;	converted to screen codes.
+	
+copy_text_screen:
+	lda #<convert_screen_code
+	sta subroutine_ptr
+	lda #>convert_screen_code
+	sta subroutine_ptr+1
+	jmp copy_screen_inner
+	
+
+; Fill color memory with white
+
+fill_color_white:
+	lda #<COLOR
+	sta g_dest_ptr
+	lda #>COLOR
+	sta g_dest_ptr+1
+	ldx #0
+	ldy #0
+@loop:
+	lda #WHITE
+	sta (g_dest_ptr), y
+	iny
+	bne @loop
+	inc g_dest_ptr+1
+	inx
+	cpx #4
+	bne @loop
+	rts
+	
+
+; Copy color RAM into the 1K section used to store a backup of the board colors.
+;	The inverse is performed in show_board.
+	
+backup_board_color:
+	lda #<COLOR
+	sta g_src_ptr
+	lda #>COLOR
+	sta g_src_ptr+1
+	lda #<BOARD_COLOR_BCKUP
+	sta g_dest_ptr
+	lda #>BOARD_COLOR_BCKUP
+	sta g_dest_ptr+1
+	jsr copy_screen_ram
+	rts
+	
+	
+; Update the status screen with the appropriate number for mines minus flags
+	
+set_flags_count:
+	lda #<cells_array
+	sta cells_ptr
+	lda #>cells_array
+	sta cells_ptr+1
+	ldy #0
+	ldx #0
+@loop:
+	cpy #TOTAL_CELLS
 	beq @end
-	sta (color_ptr), y
+	lda (cells_ptr), y
+	and #$20
+	beq @next
+	inx
+@next:
 	iny
 	jmp @loop
 @end:
-	rts
-
-
-; Sets the VIC to bitmap mode, pointing to the appropriate memory locations to
-;	display the board. Used on initial startup, and when exiting the
-;	instructions screen.
-
-switch_screen_bitmap:	
-	lda VIC_BANK_SELECT
-	and #MODE_CLEAR_MASK
-	ora #MODE_BITMAP_MASK
-	sta VIC_BANK_SELECT
-	
-	lda #BITMAP_MEM_LOCATION
-	sta V_MEMORY_LOCATION
-	
-	lda V_MODE_CTRL
-	ora #V_MODE_BITMAP_MASK
-	sta V_MODE_CTRL
-	
-	lda #DARK_GRAY
-	sta FRAME_COLOR
-	
-	rts
-	
-	
-; Sets the VIC to text mode, pointing to the appropriate memory locations to
-;	display the info screen. Used when displaying the info screen during
-;	a game.
-	
-switch_screen_text:
-	lda VIC_BANK_SELECT
-	and #MODE_CLEAR_MASK
-	ora #MODE_TEXT_MASK
-	sta VIC_BANK_SELECT
-	
-	lda #TEXT_MEM_LOCATION
-	sta V_MEMORY_LOCATION
-	
-	lda V_MODE_CTRL
-	and #V_MODE_TEXT_MASK
-	sta V_MODE_CTRL
-	
-	lda #BLACK
-	sta FRAME_COLOR
-	
-	rts
-	
-	
-; Switches the VIC back to the default bank and default text mode to display the
-;	screen data loaded at the beginning of the program, waits for user 
-;	input, then switches back to the main board view.
-	
-show_intro_again:
-	lda FRAME_COLOR
-	pha
-	jsr hide_sprites
-	jsr switch_screen_text
-@await_input:
-	jsr GETCHAR
-	beq @await_input
-	jsr switch_screen_bitmap
-	lda game_over
-	beq @change_frame
-	jsr show_sprites
-	pla
+	lda #$30
+	sta MINES_LEFT
+	sta MINES_LEFT+1
+	txa
+	eor #$FF
+	clc
+	adc #41
+	bmi @fixed_msg
+@sub10:
+	cmp #10
+	bcc @done
+	sec
+	sbc #10
+	inc MINES_LEFT
+	jmp @sub10
+@done:
+	adc #$30
+	sta MINES_LEFT+1
 	jmp @return
-@change_frame:
-	pla
-	sta FRAME_COLOR
+@fixed_msg:
+	lda #$3C
+	sta MINES_LEFT
+	lda #$30
+	sta MINES_LEFT+1
 @return:
 	rts
+	
+	
 
 	
 ;******************************************************************************
@@ -722,52 +968,32 @@ show_intro_again:
 	
 	
 ; This section of code is run only once, when the game starts for the first
-;	time. The splash/instructions screen is loaded with text, the sprites
-;	and SID pseudorandom number generator are initialized, and the screen is
-;	loaded with empty board cells.
+;	time. The character set and text screens are initialized, and 
+
+start:
+	jsr hide_screen
 	
+	lda #BLACK
+	sta BACKGROUND_COLOR
+	sta FRAME_COLOR
 	
-; Load intro screen text from definition in graphics section near the bottom
-;	of this file. This text will persist in the default bank, ready to be
-;	displayed again when the user requests to display the instructions
-;	screen again.
+	lda VIC_BANK_SELECT
+	and #$FC
+	ora #$02
+	sta VIC_BANK_SELECT
+	
 
-show_intro_screen:
-	ldx #BLACK
-	stx BACKGROUND_COLOR
-	stx FRAME_COLOR
-@loop:	
-	lda intro_screen, x
-	jsr PUTCHAR
-	inx
-	beq next_255
-	jmp @loop
-next_255:
-	ldx #0
-@loop:
-	lda intro_screen+256, x
-	jsr PUTCHAR
-	inx
-	beq last_few
-	jmp @loop
-last_few:
-	ldx #0
-@loop:
-	cpx #(end_intro_screen-intro_screen-512) 
-	beq @end
-	lda intro_screen+512, x
-	jsr PUTCHAR
-	inx
-	jmp @loop
-@end:
-
-
-; Await user input: Wait for the user to press any key, then continue with
-;	initialization code.
-
-await_input:
-	jsr GETCHAR
-	beq await_input
+init_interrupt:
+	lda IRQ_VECTOR
+	sta interrupt_service_prev
+	lda IRQ_VECTOR+1
+	sta interrupt_service_prev+1
+	sei
+	lda #<interrupt_service_extension
+	sta IRQ_VECTOR
+	lda #>interrupt_service_extension
+	sta IRQ_VECTOR+1
+	cli
 	
 	
 ; Initialize SID chip voice 3 -- the output of this voice will be used to
@@ -781,6 +1007,142 @@ init_SID_random:
 	sta SID_CTRL_3
 	
 
+init_charset:
+copy_text_chars:
+	lda #<CHAR_ROM_START
+	sta g_src_ptr
+	lda #>CHAR_ROM_START
+	sta g_src_ptr+1
+	lda #<CHAR_CUSTOM_SYMBS
+	sta g_dest_ptr
+	lda #>CHAR_CUSTOM_SYMBS
+	sta g_dest_ptr+1
+	
+	sei
+	lda $01
+	and #$FB
+	sta $01
+	
+	ldx #0
+	ldy #0
+		
+@loop:
+	lda (g_src_ptr), y
+	sta (g_dest_ptr), y
+	iny
+	bne @loop
+	inc g_src_ptr+1
+	inc g_dest_ptr+1
+	inx
+	cpx #2
+	bne @loop
+	
+	lda $01
+	ora #$04
+	sta $01
+	cli
+	
+	
+copy_graphics_chars:
+	lda #<custom_chars
+	sta g_src_ptr
+	lda #>custom_chars
+	sta g_src_ptr+1
+	lda #<CHAR_CUSTOM_GRAPH
+	sta g_dest_ptr
+	lda #>CHAR_CUSTOM_GRAPH
+	sta g_dest_ptr+1
+	
+	ldy #0	
+@loop1:
+	lda (g_src_ptr), y
+	sta (g_dest_ptr), y
+	iny
+	bne @loop1
+	
+	inc g_src_ptr+1
+	inc g_dest_ptr+1
+	ldy #97
+@loop2:
+	lda (g_src_ptr), y
+	sta (g_dest_ptr), y
+	dey
+	bpl @loop2
+
+
+load_intro_screen:
+	lda #<intro_screen
+	sta g_src_ptr
+	lda #>intro_screen
+	sta g_src_ptr+1
+	lda #<SCREEN_SPLASH
+	sta g_dest_ptr
+	lda #>SCREEN_SPLASH
+	sta g_dest_ptr+1
+	jsr copy_text_screen
+
+	
+load_details_one:
+	lda #<details_one
+	sta g_src_ptr
+	lda #>details_one
+	sta g_src_ptr+1
+	lda #<SCREEN_HOWTO_1
+	sta g_dest_ptr
+	lda #>SCREEN_HOWTO_1
+	sta g_dest_ptr+1
+	jsr copy_text_screen
+	
+	
+load_details_two:
+	lda #<details_two
+	sta g_src_ptr
+	lda #>details_two
+	sta g_src_ptr+1
+	lda #<SCREEN_HOWTO_2
+	sta g_dest_ptr
+	lda #>SCREEN_HOWTO_2
+	sta g_dest_ptr+1
+	jsr copy_text_screen
+	
+	
+load_details_three:
+	lda #<details_three
+	sta g_src_ptr
+	lda #>details_three
+	sta g_src_ptr+1
+	lda #<SCREEN_HOWTO_3
+	sta g_dest_ptr
+	lda #>SCREEN_HOWTO_3
+	sta g_dest_ptr+1
+	jsr copy_text_screen
+	
+	
+load_status:
+	lda #<status_screen
+	sta g_src_ptr
+	lda #>status_screen
+	sta g_src_ptr+1
+	lda #<SCREEN_GAMESTATS
+	sta g_dest_ptr
+	lda #>SCREEN_GAMESTATS
+	sta g_dest_ptr+1
+	jsr copy_text_screen
+	
+
+last_strip_chars:
+	ldx #0
+@loop:
+	cpx #40
+	beq @end
+	lda #$42
+	sta SCREEN_BOARD+960, x
+	inx
+	jmp @loop
+@end:
+
+
+	
 ; Load the two sprites, always displayed together in the same location, from
 ;	their definitions in the graphics section into screen memory, and
 ;	set the relevant registers to display these sprites.
@@ -797,9 +1159,9 @@ init_sprites:
 	inx
 	jmp @loop
 @end:
-	lda #INNER_SPRITE_OFFSET
+	lda #16
 	sta INNER_SPRITE_POINTER
-	lda #OUTER_SPRITE_OFFSET
+	lda #17
 	sta OUTER_SPRITE_POINTER
 	
 	lda #DARK_RED
@@ -808,22 +1170,7 @@ init_sprites:
 	sta OUTER_SPRITE_COLOR
 	
 	
-; Copy the initial board into screen memory. This will be redundantly executed
-;	below in the outer game loop, but it needs to be done on initial startup
-;	in order to avoid seeing the initial screen garbage get overwritten with
-;	board data.
-	
-	jsr draw_board
-	
-	
-; Draw the last strip in border color. Like the above, this is redundant, but
-;	is important for displaying the screen correctly the instant the text
-;	screen is switched to bitmap.
-	
-	lda #DARK_GRAY
-	sta current_color
-	jsr draw_last_strip	
-
+	jsr show_intro_screen
 	
 
 ; ******************************************************************************
@@ -852,7 +1199,31 @@ new_game:
 	sta stack_queue_ptr
 	lda #>stack_queue
 	sta stack_queue_ptr+1
+	lda #$30
+	sta SECONDS_CLOCK
+	sta SECONDS_CLOCK+1
+	sta SECONDS_CLOCK+2
+	
 
+; Initialize the board backup with the color of an unrevealed cell, as this
+;	backup will be loaded by draw_board
+
+	lda #<BOARD_COLOR_BCKUP
+	sta g_dest_ptr
+	lda #>BOARD_COLOR_BCKUP
+	sta g_dest_ptr+1
+	ldx #0
+	ldy #0
+@loop:
+	lda #LIGHT_GRAY
+	sta (g_dest_ptr), y
+	iny
+	bne @loop
+	inc g_dest_ptr+1
+	inx
+	cpx #4
+	bne @loop
+	
 
 ; Initialize the board with blank cells. As is explained in the cell array
 ;	definition, the byte $10 represents a non-mine, unflagged, unrevealed,
@@ -879,62 +1250,30 @@ initialize_cells:
 
 
 ; Position the sprites according to starting position and set them active.
+;	X starting position 167 = 23 for col 0 + 9x16 for col 9
+;	Y starting position 129 = 49 for col 0 + 5x15 for row 5
 
 pos_sprites:	
-	lda #23
+	lda #167
 	sta INNER_SPRITE_X
 	sta OUTER_SPRITE_X
 	
-	lda #49
+	lda #129
 	sta INNER_SPRITE_Y
 	sta OUTER_SPRITE_Y
 	
 	lda #0
 	sta SPRITES_X_MSB
-y_pos_sprites:	
-	ldx #0
-@loop:
-	cpx cursor_y
-	beq @end
-	lda OUTER_SPRITE_Y
-	clc
-	adc #16
-	sta OUTER_SPRITE_Y
-	lda INNER_SPRITE_Y
-	clc
-	adc #16
-	sta INNER_SPRITE_Y
-	inx
-	jmp @loop
-@end:
-x_pos_sprites:
-	ldx #0
-@loop:
-	cpx cursor_x
-	beq @end
-	lda OUTER_SPRITE_X
-	clc
-	adc #16
-	sta OUTER_SPRITE_X
-	lda INNER_SPRITE_X
-	clc
-	adc #16
-	sta INNER_SPRITE_X
-	bcc @move_on
-	lda #$03
-	sta SPRITES_X_MSB
-@move_on:
-	inx
-	jmp @loop
-@end:
+
 	jsr show_sprites
 
 	
-; Put the VIC chip into bitmap mode, pointing to the appropriate memory banks.
-;	This is redundant all times this code is executed except the first, but
-;	is used to ensure the screen is not shown until it is fully set up.
+; Set the frame color to dark gray and show the board.
 
-	jsr switch_screen_bitmap
+	lda #DARK_GRAY
+	sta FRAME_COLOR
+	jsr show_board
+	
 
 
 ; ******************************************************************************
@@ -948,7 +1287,7 @@ x_pos_sprites:
 ;	itself is defined in a later section.
 	
 get_input:
-	jsr GETCHAR
+	jsr CHROUT
 	tax
 @check_n:
 	cmp #$4E
@@ -960,8 +1299,20 @@ get_input:
 @check_i:
 	tax
 	cmp #$49
-	bne @check_game_over
+	bne @check_howto
 	jsr show_intro_again
+	jmp get_input
+@check_howto:
+	tax
+	cmp #$48
+	bne @check_status
+	jsr show_howto_screen
+	jmp get_input
+@check_status:
+	tax
+	cmp #$47
+	bne @check_game_over
+	jsr show_status_screen
 	jmp get_input
 @check_game_over:
 	lda game_over
@@ -999,23 +1350,22 @@ get_input:
 	cmp #2
 	beq get_input
 	jsr right_click_cell
-	jsr draw_board
-	jsr check_state
 	jmp get_input
 @check_space:
 	txa
 	cmp #$20
-	bne get_input
+	bne @to_get_input
 	lda game_over
 	cmp #2
 	bne @after_first_click
 	lda #1
 	sta game_over
 	jsr initialize_mines
+	lda #IRQ_PER_SECOND
+	sta interrupts_clock
 @after_first_click:
 	jsr left_click_cell
-	jsr draw_board
-	jsr check_state
+@to_get_input:
 	jmp get_input
 	
 
@@ -1033,8 +1383,8 @@ get_input:
 ; ************* Board Initialization *************
 
 ; Called after the first left click is made. These next several routines flow
-;	from one to another until the rts instruction is reached at the end of
-;	zero_mine_adjacencies. After this code is run, the board will be 
+;	from one to another and run as a loop until the correct number of 
+;	mines have been placed. After this code is run, the board will be 
 ;	populated with the correct number of mines in random locations with no
 ;	mines adjacent to the cell that was clicked first. Avoiding this first-
 ;	clicked cell ensures that the first click will always reveal more than
@@ -1056,7 +1406,7 @@ initialize_mines:
 ; Initialize mines_placed counter before the main loop.
 
 randomize_board:
-	lda #0
+	lda #MINES
 	sta mines_placed
 	
 	
@@ -1140,21 +1490,23 @@ convert_y:
 	lda #0
 	sta current_line
 	sta current_col
-@loop:
 	cpy #0
 	beq @end
+@loop:
 	jsr cells_ptr_down
 	inc current_line
 	dey
+	beq @end
 	jmp @loop
 @end:
 convert_x:
-@loop:
 	cpx #0
 	beq @end
+@loop:
 	jsr cells_ptr_right
 	inc current_col
 	dex
+	beq @end
 	jmp @loop
 @end:
 	
@@ -1177,10 +1529,9 @@ check_mine:
 	ora #$80
 	and #$F0
 	sta (cells_ptr),y
-	inc mines_placed
+	dec mines_placed
 	jsr for_all_surrounding
 	lda mines_placed
-	cmp #MINES
 	beq @end
 @go_back:
 	jmp get_randoms
@@ -1283,20 +1634,22 @@ set_cells_ptr_to_cursor:
 	sta cells_ptr+1
 	ldx cursor_y
 	stx current_line
-@y_loop:
 	cpx #0
 	beq @end
+@y_loop:
 	jsr cells_ptr_down
 	dex
+	beq @end
 	jmp @y_loop
 @end:
 	ldx cursor_x
 	stx current_col
-@x_loop:
 	cpx #0
 	beq @done
+@x_loop:
 	jsr cells_ptr_right
 	dex
+	beq @done
 	jmp @x_loop
 @done:
 	rts
@@ -1337,6 +1690,11 @@ reveal_mines_flags:
 ; ********* Left-Click and Right-Click **********
 
 
+; Both the left-click and right-click routines will draw the board and check the
+;	game state if and only if the board has been udpated.
+
+
+; ------------------------------------------------
 ; The left-click routine is complicated by the fact that when an unflagged,
 ;	unrevealed cell with no adjacent mines is clicked, all surrounding
 ;	unflagged cells must be programmatically clicked, which can in turn
@@ -1382,6 +1740,7 @@ reveal_mines_flags:
 left_click_cell:
 	jsr set_cells_ptr_to_cursor
 	ldy #0
+	sta board_updated
 	lda (cells_ptr), y
 	and #$40
 	bne click_surrounding
@@ -1398,14 +1757,17 @@ chain_click_loop:
 	lda stack_queue_ptr+1
 	cmp #>stack_queue
 	bne @get_next_cell
+	lda board_updated
+	beq @dont_update
+	jsr draw_board
+	jsr check_state
+@dont_update:
 	rts
 @get_next_cell:
 click_adjacent_cells:
 	jsr stack_queue_get
 	jsr for_all_surrounding
 	jmp chain_click_loop
-reset_stack_queue_ptr:
-	rts
 
 
 ; As was explained earlier, this subroutine is called when left-clicking a
@@ -1436,10 +1798,11 @@ reveal_put_valid_cell:
 	jsr reveal_mines_flags
 	rts
 @set_revealed:
+	lda #1
+	sta board_updated
 	lda (cells_ptr), y
 	ora #$50
 	sta (cells_ptr), y
-	lda (cells_ptr), y
 	and #$0F
 	bne @dont_put
 	jsr stack_queue_put
@@ -1495,7 +1858,7 @@ check_flags_surrounding:
 	
 ; ------------------------------------------------
 ; "Right-clicks" a cell, flagging any unflagged unrevealed cell and unflagging
-;	any flagged unrevealed cell. Revealed cells are unaffected.
+;	any flagged unrevealed cell. Revealed cells are unaffected. 
 
 right_click_cell:
 	jsr set_cells_ptr_to_cursor
@@ -1503,7 +1866,7 @@ right_click_cell:
 	lda (cells_ptr),y
 	and #$40
 	beq @unrevealed
-	rts
+	jmp @return
 @unrevealed:
 	lda (cells_ptr), y
 	ora #$10
@@ -1514,11 +1877,15 @@ right_click_cell:
 	lda (cells_ptr), y
 	and #$DF
 	sta (cells_ptr), y
-	rts
+	jmp @update_and_return
 @not_flagged:
 	lda (cells_ptr), y
 	ora #$20
 	sta (cells_ptr), y
+@update_and_return:
+	jsr draw_board
+	jsr check_state
+@return:
 	rts
 	
 
@@ -1548,10 +1915,10 @@ draw_board:
 	sta color_ptr
 	lda #>COLOR
 	sta color_ptr+1
-	lda #<BITMAP
-	sta bitmap_ptr
-	lda #>BITMAP
-	sta bitmap_ptr+1
+	lda #<SCREEN_BOARD
+	sta g_dest_ptr
+	lda #>SCREEN_BOARD
+	sta g_dest_ptr+1
 	lda #0
 	sta current_line
 	sta current_col
@@ -1565,8 +1932,8 @@ draw_board:
 	jsr cells_ptr_right
 	jsr color_ptr_right
 	jsr color_ptr_right
-	jsr bitmap_ptr_right
-	jsr bitmap_ptr_right
+	jsr g_dest_ptr_right
+	jsr g_dest_ptr_right
 	inc current_col
 	lda current_col
 	cmp #X_RANGE
@@ -1577,7 +1944,7 @@ draw_board:
 	lda current_line
 	cmp #Y_RANGE
 	beq @end
-	jsr bitmap_ptr_down
+	jsr g_dest_ptr_down
 	jsr color_ptr_down
 	jmp @loop
 @end:
@@ -1594,21 +1961,21 @@ draw_board_cell:
 	sta (cells_ptr), y
 	jsr identify_cell
 	jsr draw_one_graphics_cell
-	jsr bitmap_ptr_right
+	jsr g_dest_ptr_right
+	jsr g_src_ptr_advance
 	jsr color_ptr_right
-	jsr graphics_ptr_right
 	jsr draw_one_graphics_cell
-	jsr bitmap_ptr_down
+	jsr g_dest_ptr_down
+	jsr g_src_ptr_advance
 	jsr color_ptr_down
-	jsr graphics_ptr_down
 	jsr draw_one_graphics_cell
-	jsr bitmap_ptr_left
+	jsr g_dest_ptr_left
+	jsr g_src_ptr_advance
 	jsr color_ptr_left
-	jsr graphics_ptr_left
 	jsr draw_one_graphics_cell
-	jsr bitmap_ptr_up
+	jsr g_dest_ptr_up
+	jsr g_src_ptr_advance
 	jsr color_ptr_up
-	jsr graphics_ptr_up
 	rts
 	
 	
@@ -1617,16 +1984,9 @@ draw_board_cell:
 	
 draw_one_graphics_cell:
 	lda current_color
-	ldy #0
 	sta (color_ptr), y
-@loop:
-	cpy #8
-	beq @end
-	lda (graphics_ptr), y
-	sta (bitmap_ptr), y
-	iny
-	jmp @loop
-@end:
+	lda (g_src_ptr), y
+	sta (g_dest_ptr), y
 	rts
 	
 	
@@ -1640,18 +2000,18 @@ identify_cell:
 	and #$40
 	bne @revealed
 	lda #<unrevealed
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>unrevealed
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #LIGHT_GRAY
 	and #$0F
 	sta current_color
 	rts
 @flagged:
 	lda #<flag
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>flag
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda (cells_ptr), y
 	and #$C0
 	cmp #$40
@@ -1670,9 +2030,9 @@ identify_cell:
 	and #$80
 	beq @not_mine
 	lda #<mine
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>mine
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda (cells_ptr), y
 	and #$0F
 	bne @exploded
@@ -1690,9 +2050,9 @@ identify_cell:
 	and #$0F
 	bne @not_zero
 	lda #<revealed_0
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_0
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #MID_GRAY
 	and #$0F
 	sta current_color
@@ -1701,9 +2061,9 @@ identify_cell:
 	cmp #1
 	bne @not_one
 	lda #<revealed_1
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_1
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #LIGHT_BLUE
 	and #$0F
 	sta current_color
@@ -1712,9 +2072,9 @@ identify_cell:
 	cmp #2
 	bne @not_two
 	lda #<revealed_2
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_2
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #GREEN
 	and #$0F
 	sta current_color
@@ -1723,9 +2083,9 @@ identify_cell:
 	cmp #3
 	bne @not_three
 	lda #<revealed_3
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_3
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #LIGHT_RED
 	and #$0F
 	sta current_color
@@ -1734,9 +2094,9 @@ identify_cell:
 	cmp #4
 	bne @not_four
 	lda #<revealed_4
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_4
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #DARK_BLUE
 	and #$0F
 	sta current_color
@@ -1745,9 +2105,9 @@ identify_cell:
 	cmp #5
 	bne @not_five
 	lda #<revealed_5
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_5
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #DARK_RED
 	and #$0F
 	sta current_color
@@ -1756,9 +2116,9 @@ identify_cell:
 	cmp #6
 	bne @not_six
 	lda #<revealed_6
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_6
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #CYAN
 	and #$0F
 	sta current_color
@@ -1767,18 +2127,18 @@ identify_cell:
 	cmp #7
 	bne @not_seven
 	lda #<revealed_7
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_7
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #ORANGE
 	and #$0F
 	sta current_color
 	rts
 @not_seven:
 	lda #<revealed_8
-	sta graphics_ptr
+	sta g_src_ptr
 	lda #>revealed_8
-	sta graphics_ptr+1
+	sta g_src_ptr+1
 	lda #BROWN
 	and #$0F
 	sta current_color
@@ -1796,25 +2156,144 @@ identify_cell:
 ; ------------------------------------------------
 	
 intro_screen:
-.byte $93, $05, $0D
-.byte "              minesweeper", $0D, $0D
-.byte "        written in 6502 assembly", $0D, $0D
-.byte "           programmed for the", $0D
-.byte "        commodore 64 in 2022 by", $0D
-.byte "             kai sandstrom", $0D, $0D
-.byte "       controls:", $0D, $0D
-.byte "       wasd:   move cursor", $0D
-.byte "       space:  clear mine", $0D
-.byte "       e:      flag/unflag mine", $0D
-.byte "       n:      start new game", $0D
-.byte "       i:      show instructions", $0D, $0D
-.byte " revealed cells with the correct number", $0D
-.byte " of flags surrounding can be clicked to", $0D
-.byte "  reveal remaining cells. if the flags", $0D
-.byte " are incorrect, a mine will be clicked,", $0D
-.byte "       and the game will be lost.", $0D, $0D
-.byte "       press any key to continue."
-end_intro_screen:
+.byte "    ", $64, $65, "        minesweeper     "
+.byte "    ", $64, $65, "    "
+.byte "    ", $67, $66, "    for the commodore 64"
+.byte "    ", $67, $66, "    "
+.byte "                                        "
+.byte "    written in 2022 by kai sandstrom    "
+.byte "  programmed entirely in 6502 assembly  "
+.byte "                                        "
+.byte "                                        "
+.byte "               controls:                "
+.byte "                                        "
+.byte "wasd:  move cursor                      "
+.byte "                                        "
+.byte "space: clear mine                       "
+.byte "                                        "
+.byte "e:     flag/unflag mine                 "
+.byte "                                        "
+.byte "n:     start new game                   "
+.byte "                                        "
+.byte "h:     how to play/detailed instructions"
+.byte "                                        "
+.byte "g:     show game status screen          "
+.byte "                                        "
+.byte "i:     show this screen again           "
+.byte "                                        "
+.byte "                                        "
+.byte "       press any key to continue.       "
+
+details_one:
+.byte "the goal of minesweeper is to flag all  "
+.byte "mines and clear all non-mine cells. a   "
+.byte "fixed number of mines are distributed   "
+.byte "randomly on the board. all cells start  "
+.byte "out hidden.                             "
+.byte "                                        "
+.byte "press space to clear the cell indicated "
+.byte "by the cursor. if the cell is a mine,   "
+.byte "the game is lost.                       "
+.byte "                                        "
+.byte "clearing a cell will show how many mines"
+.byte "are adjacent to the newly-cleared cell, "
+.byte "indicated by a number. if a cell has no "
+.byte "adjacent mines, it will appear blank    "
+.byte "like a hidden cell, but will show a     "
+.byte "a darker shade of gray.                 "
+.byte "                                        "
+.byte "when a cell with no adjacent mines is   "
+.byte "cleared, all mines adjacent to it are   "
+.byte "cleared as well. this operation chains  "
+.byte "until the entire contiguous area with   "
+.byte "no adjacent mines is revealed.          "
+.byte "                                        "
+.byte "                                        "
+.byte "      press any key to continue.        "
+
+details_two:
+
+.byte "your first reveal operation is always   "
+.byte "guaranteed to reveal more than one cell:"
+.byte "no mines will be placed adjacent to the "
+.byte "location of your first clear operation. "
+.byte "                                        "
+.byte "use the f key to flag a hidden cell or  "
+.byte "unflag a flagged cell. a cleared cell   "
+.byte "cannot be flagged, and a flagged cell   "
+.byte "cannot be cleared.                      "
+.byte "                                        "
+.byte "a flag indicates that a cell is known   "
+.byte "to be a mine. flag cells that you are   "
+.byte "certain are mines, and use the number   "
+.byte "and placement of flags to determine     "
+.byte "which other cells are mines.            "
+.byte "                                        "
+.byte "in most circumstances, attempting to    "
+.byte "clear an already-revealed cell will     "
+.byte "have no effect; however, if a cleared   "
+.byte "cell has the same number of flags       "
+.byte "adjacent to it as its number of adjacent"
+.byte "mines, pressing space on this cell will "
+.byte "clear all adjacent hidden cells.        "
+.byte "                                        "
+.byte "      press any key to continue.        "
+
+details_three:
+.byte "                                        "
+.byte "if the adjacent flags were placed       "
+.byte "incorrectly and a mine is revealed by   "
+.byte "this operation, the game is lost.       "
+.byte "                                        "
+.byte "press g to show the game status screen. "
+.byte "                                        "
+.byte "the ", $22, "mines minus flags", $22 
+.byte " field displays  "
+.byte "the number of flags on the field        "
+.byte "subtracted from the total number of     "
+.byte "mines displayed on the previous line.   "
+.byte "when all flags are placed correctly,    "
+.byte "this number represents the number of    "
+.byte "unflagged mines remaining on the board. "
+.byte "                                        "
+.byte "the timer is activated when the first   "
+.byte "clear operation is performed. it freezes"
+.byte "when a game is won or lost, and is reset"
+.byte "to zero when the n key is pressed. keep "
+.byte "track of your shortest times and compete"
+.byte "for the fastest win!                    "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "  press any key to return to the game.  "
+
+
+status_screen:
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "    total mines:        40              "
+.byte "                                        "
+.byte "                                        "
+.byte "    mines minus flags:  40              "
+.byte "                                        "
+.byte "                                        "
+.byte "    current game timer: 000 seconds     "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
+.byte "                                        "
 
 sprite_outer:
 .byte %11111111, %11111111, %11100000
@@ -1862,413 +2341,493 @@ sprite_inner:
 .byte %00000000, %00000000, %00000000
 .byte %00000000, %00000000, %00000000
 	
+	
+	
+; Custom graphics characters: The following 44 sets of 8 bytes are custom
+;	graphics characters that are loaded into character memory at the start
+;	of program execution. Each board tile is made up of four characters,
+;	listed in the order top-left, top-right, bottom-right, bottom-left.
+
+custom_chars:
+
+
+; revealed 0 / unrevealed
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01111111  
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %11111111  
+.byte %11111111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %11111111
+.byte %11111111
+.byte %11111111
+.byte %11111111 
+.byte %11111111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111  
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 1
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111110
+.byte %01111100
+.byte %01111000
+.byte %01111110
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00111111
+.byte %00111111
+.byte %00111111
+.byte %00111111
+.byte %00111111
+
+.byte %00111111
+.byte %00111111
+.byte %00111111
+.byte %00001111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01111110
+.byte %01111110
+.byte %01111110
+.byte %01111000
+.byte %01111000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 2
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01110000
+.byte %01100000
+.byte %01100011
+.byte %01111111
+.byte %01111111
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00001111
+.byte %00000111
+.byte %11000111
+.byte %11000111
+.byte %00001111
+
+.byte %00011111
+.byte %01111111
+.byte %11111111
+.byte %00000111
+.byte %00000111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01111100
+.byte %01110000
+.byte %01100001
+.byte %01100000
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 3
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01100000
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01111100
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00001111
+.byte %00000111
+.byte %11000111
+.byte %11000111
+.byte %00001111
+
+.byte %00001111
+.byte %11000111
+.byte %11000111
+.byte %00000111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01111100
+.byte %01111111
+.byte %01111111
+.byte %01100000
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 4
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01111000
+.byte %01111000
+.byte %01110001
+.byte %01110001
+.byte %01100000
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %10001111
+.byte %10001111
+.byte %10001111
+.byte %10001111
+.byte %00000111
+
+.byte %00000111
+.byte %10001111
+.byte %10001111
+.byte %10001111
+.byte %10001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 5
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01100000
+.byte %01100000
+.byte %01100011
+.byte %01100011
+.byte %01100000
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00000111
+.byte %00000111
+.byte %11111111
+.byte %11111111
+.byte %00001111
+
+.byte %00000111
+.byte %11000111
+.byte %11000111
+.byte %00000111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01100000
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 6
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01110000
+.byte %01100000
+.byte %01100011
+.byte %01100011
+.byte %01100000
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00001111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %00001111
+
+.byte %00000111
+.byte %11000111
+.byte %11000111
+.byte %00000111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01100000
+.byte %01100011
+.byte %01100011
+.byte %01100000
+.byte %01110000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 7
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01100000
+.byte %01100000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00000111
+.byte %00000111
+.byte %11000111
+.byte %11000111
+.byte %10001111
+
+.byte %10001111
+.byte %00011111
+.byte %00011111
+.byte %00111111
+.byte %00111111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111110
+.byte %01111110
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; revealed 8
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01110000
+.byte %01100000
+.byte %01100011
+.byte %01100011
+.byte %01110000
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %00001111
+.byte %00000111
+.byte %11000111
+.byte %11000111
+.byte %00001111
+
+.byte %00001111
+.byte %11000111
+.byte %11000111
+.byte %00000111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01110000
+.byte %01100011
+.byte %01100011
+.byte %01100000
+.byte %01110000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; mine
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01110100
+.byte %01111000
+.byte %01110011
+.byte %01110011
+
+.byte %00000000
+.byte %11111111
+.byte %01111111
+.byte %01111111
+.byte %00010111
+.byte %00001111
+.byte %00000111
+.byte %00000111
+
+.byte %00000001
+.byte %00000111
+.byte %00000111
+.byte %00001111
+.byte %00010111
+.byte %01111111
+.byte %01111111
+.byte %11111111
+
+.byte %01000000
+.byte %01110000
+.byte %01110000
+.byte %01111000
+.byte %01110100
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+
+; flag
+
+.byte %00000000
+.byte %01111111
+.byte %01111111
+.byte %01111110
+.byte %01111000
+.byte %01110000
+.byte %01111000
+.byte %01111110
+
+.byte %00000000
+.byte %11111111
+.byte %11111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+.byte %01111111
+.byte %01111111
+.byte %00111111
+.byte %00001111
+.byte %00001111
+.byte %11111111
+.byte %11111111
+.byte %11111111
+
+.byte %01111111
+.byte %01111111
+.byte %01111100
+.byte %01110000
+.byte %01110000
+.byte %01111111
+.byte %01111111
+.byte %01111111
+
+
+; Custom character screen codes: This data section lists the screen codes of
+;	the four custom graphics characters that make up each tile type on the
+;	board.
+
 revealed_0:
 unrevealed:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $40, $41, $42, $43
 
 revealed_1:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000001
-.byte %10000011
-.byte %10000111
-.byte %10000001
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11000000
-.byte %11000000
-.byte %11000000
-.byte %11000000
-.byte %11000000
-
-.byte %10000001
-.byte %10000001
-.byte %10000001
-.byte %10000111
-.byte %10000111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11000000
-.byte %11000000
-.byte %11000000
-.byte %11110000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $44, $45, $46, $47
 
 revealed_2:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10001111
-.byte %10011111
-.byte %10011100
-.byte %10000000
-.byte %10000000
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11110000
-.byte %11111000
-.byte %00111000
-.byte %00111000
-.byte %11110000
-
-.byte %10000011
-.byte %10001111
-.byte %10011110
-.byte %10011111
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11100000
-.byte %10000000
-.byte %00000000
-.byte %11111000
-.byte %11111000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $48, $49, $4A, $4B
 
 revealed_3:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10011111
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10000011
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11110000
-.byte %11111000
-.byte %00111000
-.byte %00111000
-.byte %11110000
-
-.byte %10000011
-.byte %10000000
-.byte %10000000
-.byte %10011111
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11110000
-.byte %00111000
-.byte %00111000
-.byte %11111000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $4C, $4D, $4E, $4F
 
 revealed_4:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10000111
-.byte %10000111
-.byte %10001110
-.byte %10001110
-.byte %10011111
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %01110000
-.byte %01110000
-.byte %01110000
-.byte %01110000
-.byte %11111000
-
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11111000
-.byte %01110000
-.byte %01110000
-.byte %01110000
-.byte %01110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $50, $51, $52, $53
 
 revealed_5:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10011111
-.byte %10011111
-.byte %10011100
-.byte %10011100
-.byte %10011111
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11111000
-.byte %11111000
-.byte %00000000
-.byte %00000000
-.byte %11110000
-
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10011111
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11111000
-.byte %00111000
-.byte %00111000
-.byte %11111000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $54, $55, $56, $57
 
 revealed_6:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10001111
-.byte %10011111
-.byte %10011100
-.byte %10011100
-.byte %10011111
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11110000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %11110000
-
-.byte %10011111
-.byte %10011100
-.byte %10011100
-.byte %10011111
-.byte %10001111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11111000
-.byte %00111000
-.byte %00111000
-.byte %11111000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $58, $59, $5A, $5B
 
 revealed_7:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10011111
-.byte %10011111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11111000
-.byte %11111000
-.byte %00111000
-.byte %00111000
-.byte %01110000
-
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000001
-.byte %10000001
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %01110000
-.byte %11100000
-.byte %11100000
-.byte %11000000
-.byte %11000000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $5C, $5D, $5E, $5F
 
 revealed_8:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10001111
-.byte %10011111
-.byte %10011100
-.byte %10011100
-.byte %10001111
-
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %11110000
-.byte %11111000
-.byte %00111000
-.byte %00111000
-.byte %11110000
-
-.byte %10001111
-.byte %10011100
-.byte %10011100
-.byte %10011111
-.byte %10001111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11110000
-.byte %00111000
-.byte %00111000
-.byte %11111000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
+.byte $60, $61, $62, $63
 
 mine:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10001011
-.byte %10000111
-.byte %10001100
-.byte %10001100
-
-.byte %11111111
-.byte %00000000
-.byte %10000000
-.byte %10000000
-.byte %11101000
-.byte %11110000
-.byte %11111000
-.byte %11111000
-
-.byte %10111111
-.byte %10001111
-.byte %10001111
-.byte %10000111
-.byte %10001011
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %11111110
-.byte %11111000
-.byte %11111000
-.byte %11110000
-.byte %11101000
-.byte %10000000
-.byte %10000000
-.byte %00000000
+.byte $64, $65, $66, $67
 
 flag:
-.byte %11111111
-.byte %10000000
-.byte %10000000
-.byte %10000001
-.byte %10000111
-.byte %10001111
-.byte %10000111
-.byte %10000001
+.byte $68, $69, $6A, $6B
 
-.byte %11111111
-.byte %00000000
-.byte %00000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %10000000
-.byte %10000000
-.byte %10000011
-.byte %10001111
-.byte %10001111
-.byte %10000000
-.byte %10000000
-.byte %10000000
-
-.byte %10000000
-.byte %10000000
-.byte %11000000
-.byte %11110000
-.byte %11110000
-.byte %00000000
-.byte %00000000
-.byte %00000000
 
 after_graphics:
 
