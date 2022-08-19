@@ -8,7 +8,7 @@ Commodroe 64. The first mostly-functional version of this program was completed
 in about three days, and much more work has been done since.
 
 In its current state, C64-Minesweeper supports one board size and difficulty --
-a 12x24 board with 40 mines. 
+a 12x20 board with 40 mines. 
 
 Future plans include:
 - Compression of whitespace in text screen data
